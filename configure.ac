@@ -207,6 +207,15 @@ UNI_PLUGIN_ENABLED(recorder)
 
 AM_CONDITIONAL([RECORDER_PLUGIN],[test "${enable_recorder_plugin}" = "yes"])
 
+dnl Optional HTTP speech adapters (libcurl >= 7.56, json-c >= 0.15).
+AC_ARG_ENABLE([http-tts-plugin], [AS_HELP_STRING([--enable-http-tts-plugin],[build HTTP TTS adapter])], [enable_http_tts_plugin="$enableval"], [enable_http_tts_plugin="no"])
+AC_ARG_ENABLE([http-asr-plugin], [AS_HELP_STRING([--enable-http-asr-plugin],[build HTTP ASR adapter])], [enable_http_asr_plugin="$enableval"], [enable_http_asr_plugin="no"])
+AM_CONDITIONAL([HTTP_TTS_PLUGIN],[test "${enable_http_tts_plugin}" = "yes"])
+AM_CONDITIONAL([HTTP_ASR_PLUGIN],[test "${enable_http_asr_plugin}" = "yes"])
+if test "${enable_http_tts_plugin}" = "yes" || test "${enable_http_asr_plugin}" = "yes"; then
+    PKG_CHECK_MODULES([HTTP_SPEECH],[libcurl >= 7.56 json-c >= 0.15])
+fi
+
 dnl Enable test suites.
 AC_ARG_ENABLE(test-suites,
     [AC_HELP_STRING([--enable-test-suites  ],[build test suites])],
@@ -233,6 +242,8 @@ AC_CONFIG_FILES([
     modules/mrcp-sofiasip/Makefile
     modules/mrcp-unirtsp/Makefile
     plugins/Makefile
+    plugins/http-tts/Makefile
+    plugins/http-asr/Makefile
     plugins/mrcp-recorder/Makefile
     plugins/demo-synth/Makefile
     plugins/demo-recog/Makefile

@@ -19,6 +19,13 @@ option (ENABLE_AMR_CODEC           "Enable AMR Codec"                           
 
 option (ENABLE_TEST_SUITES         "Enable test suites"                             OFF)
 
+option (ENABLE_HTTP_TTS_PLUGIN "Enable HTTP TTS adapter" OFF)
+option (ENABLE_HTTP_ASR_PLUGIN "Enable HTTP ASR adapter" OFF)
+if (ENABLE_HTTP_TTS_PLUGIN OR ENABLE_HTTP_ASR_PLUGIN)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(HTTP_SPEECH REQUIRED libcurl>=7.56 json-c>=0.15)
+endif ()
+
 # Organize targets into folders
 set_property (GLOBAL PROPERTY USE_FOLDERS ON)
 
@@ -90,6 +97,9 @@ set (UNIMRCP_CLIENT_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/platforms/libunimrcp-client
 set (UNIMRCP_SERVER_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/platforms/libunimrcp-server/include)
 set (VERSION_INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/build)
 
+# Shared HTTP dependencies for optional speech adapters.
+link_directories(${HTTP_SPEECH_LIBRARY_DIRS})
+
 # Sub-projects: libraries
 add_subdirectory (libs/apr-toolkit)
 add_subdirectory (libs/mpf)
@@ -110,6 +120,13 @@ add_subdirectory (modules/mrcp-sofiasip)
 add_subdirectory (modules/mrcp-unirtsp)
 
 # Sub-projects: plug-ins
+if (ENABLE_HTTP_TTS_PLUGIN)
+    add_subdirectory(plugins/http-tts)
+endif ()
+if (ENABLE_HTTP_ASR_PLUGIN)
+    add_subdirectory(plugins/http-asr)
+endif ()
+
 if (ENABLE_DEMORECOG_PLUGIN)
 add_subdirectory (plugins/demo-recog)
 endif ()

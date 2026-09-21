@@ -32,3 +32,5 @@ endif
 
 install-data-local:
 	test -d $(DESTDIR)$(sysconfdir) || $(MAKE) def-conf
+
+EXTRA_DIST = unimrcpserver-http.xml
