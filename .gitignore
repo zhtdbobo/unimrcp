@@ -10,8 +10,9 @@
 *.dirstamp
 .libs
 .deps
-
+dist/
 # /
+/.env
 /debug
 /release
 /Debug

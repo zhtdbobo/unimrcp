@@ -1,0 +1,38 @@
+name: unimrcp-http
+
+services:
+  unimrcp:
+    image: "${UNIMRCP_IMAGE:-local/unimrcp-http:1.8.0}"
+    platform: linux/amd64
+    # Use the image already imported with docker load.
+    pull_policy: never
+    restart: unless-stopped
+    # Linux host networking keeps SIP/SDP and RTP addresses consistent.
+    network_mode: host
+    stop_grace_period: 30s
+    environment:
+      UNIMRCP_HTTP_ASR_URL: "${UNIMRCP_HTTP_ASR_URL:-http://127.0.0.1:8887/v1/asr/upload}"
+      UNIMRCP_HTTP_TTS_URL: "${UNIMRCP_HTTP_TTS_URL:-http://127.0.0.1:8889/api/v1/tts}"
+    volumes:
+      - type: bind
+        source: ./conf/unimrcpserver-http.xml
+        target: /opt/unimrcp/conf/unimrcpserver.xml
+        read_only: true
+        bind:
+          create_host_path: false
+    # Override the test image's CMD; run the server in the foreground.
+    command:
+      - stdbuf
+      - -oL
+      - -eL
+      - /opt/unimrcp/bin/unimrcpserver
+      - -r
+      - /opt/unimrcp
+      - -w
+      - -o
+      - "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

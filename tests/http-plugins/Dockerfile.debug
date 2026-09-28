@@ -1,0 +1,20 @@
+# Offline diagnostics for the exact image deployed to the server.
+ARG BASE_IMAGE=local/unimrcp-http:1.8.0
+FROM ${BASE_IMAGE}
+
+# Refuse to silently upgrade the libraries involved in server startup.
+RUN dpkg-query -W libc6 libsofia-sip-ua0 libcurl4 libjson-c5 libssl3 \
+      > /tmp/unimrcp-runtime.before \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --no-upgrade gdb \
+    && dpkg-query -W libc6 libsofia-sip-ua0 libcurl4 libjson-c5 libssl3 \
+      > /tmp/unimrcp-runtime.after \
+    && diff -u /tmp/unimrcp-runtime.before /tmp/unimrcp-runtime.after \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY conf/unimrcpserver-http.xml /opt/unimrcp/conf/unimrcpserver.xml
+COPY tests/http-plugins/debug_startup.sh /usr/local/bin/unimrcp-debug
+RUN sed -i 's/\r$//' /usr/local/bin/unimrcp-debug \
+    && chmod +x /usr/local/bin/unimrcp-debug
+
+CMD ["/usr/local/bin/unimrcp-debug"]

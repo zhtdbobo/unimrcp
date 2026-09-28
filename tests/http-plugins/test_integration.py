@@ -95,6 +95,27 @@ def free_port():
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0)); return s.getsockname()[1]
 
+def check_sip_tcp(sip_port):
+    # The ASR/TTS sessions below use UDP. Check a real SIP response over TCP
+    # too, so omitting the explicit transport list cannot silently disable it.
+    with socket.create_connection(('127.0.0.1', sip_port), timeout=5) as sip:
+        call_id = uuid.uuid4().hex
+        message = (f'OPTIONS sip:server@127.0.0.1:{sip_port} SIP/2.0\r\n'
+                   f'Via: SIP/2.0/TCP 127.0.0.1:{sip.getsockname()[1]};branch=z9hG4bK{uuid.uuid4().hex};rport\r\n'
+                   f'From: <sip:test@127.0.0.1>;tag={uuid.uuid4().hex}\r\n'
+                   f'To: <sip:server@127.0.0.1:{sip_port}>\r\n'
+                   f'Call-ID: {call_id}\r\nCSeq: 1 OPTIONS\r\n'
+                   'Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n')
+        sip.sendall(message.encode())
+        response = b''
+        while b'\r\n\r\n' not in response:
+            part = sip.recv(65536)
+            assert part, 'SIP TCP connection closed before response headers'
+            response += part
+        assert response.startswith(b'SIP/2.0 200 '), response
+        assert call_id.encode() in response, response
+    print('PASS: SIP OPTIONS over TCP with default transports', flush=True)
+
 class Session:
     def __init__(self, sip_port, resource):
         self.sip_port, self.resource = sip_port, resource
@@ -304,6 +325,7 @@ def main():
                     time.sleep(.1)
             else:
                 raise AssertionError('MRCP listener did not start')
+            check_sip_tcp(sip)
             exercise(sip)
             assert process.poll() is None
         except Exception:

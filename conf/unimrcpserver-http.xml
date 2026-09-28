@@ -42,7 +42,9 @@
       <!-- <sip-ip>10.10.0.1</sip-ip> -->
       <!-- <sip-ext-ip>a.b.c.d</sip-ext-ip> -->
       <sip-port>8060</sip-port>
-      <sip-transport>udp,tcp</sip-transport>
+      <!-- Use Sofia-SIP's default transports (UDP and TCP in the Debian image).
+           The old Debian Sofia-SIP library has a lifetime bug when parsing a
+           comma-separated transport list. Leave sip-transport unset. -->
       <!-- <force-destination>true</force-destination> -->
       <!--
         This parameter can be used to disable the Sofia SIP SDP Offer/Answer Engine Module (soa).
