@@ -5,6 +5,7 @@ project (httpasr)
 set (HTTP_SOURCES
 	src/http_asr_engine.c
     ../http-common/http_common.c
+    ../http-common/http_stream.c
 )
 source_group ("src" FILES ${HTTP_SOURCES})
 

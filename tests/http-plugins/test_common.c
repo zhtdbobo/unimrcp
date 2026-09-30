@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include "http_common.h"
+#include "http_stream.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,15 @@ int main(void)
     assert(xml && strstr(xml,"&lt;&amp;&quot;&apos;")); free(xml);
     assert(!hp_nlsml("bad\x01",4));
     wav.limit=4; assert(hp_buffer_append(&wav,"1234",4)); assert(!hp_buffer_append(&wav,"5",1)); hp_buffer_free(&wav);
+    {
+        unsigned char data[8],out[8]; hp_ring ring={data,0,0,sizeof(data)};
+        assert(hp_ring_write(&ring,"123456",6));
+        assert(!hp_ring_write(&ring,"789",3));
+        assert(hp_ring_read(&ring,out,4)==4 && !memcmp(out,"1234",4));
+        assert(hp_ring_write(&ring,"789012",6));
+        assert(hp_ring_read(&ring,out,8)==8 && !memcmp(out,"56789012",8));
+        assert(hp_ring_read(&ring,out,8)==0);
+    }
     puts("PASS: PCM/WAV roundtrip, truncation, rate validation, exact placeholder, XML escaping, size limits");
     return 0;
 }

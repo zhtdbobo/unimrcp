@@ -126,11 +126,15 @@
       <engine id="HTTP-TTS" name="httptts" enable="true">
         <max-channel-count>10</max-channel-count>
         <param name="url" value="http://127.0.0.1:8889/api/v1/tts"/>
+        <!-- Set stream-url (or UNIMRCP_STREAM_TTS_URL) to enable incremental PCM playback. -->
+        <!-- <param name="stream-url" value="http://127.0.0.1:8889/api/v1/tts/stream"/> -->
         <param name="http-timeout-ms" value="60000"/>
       </engine>
       <engine id="HTTP-ASR" name="httpasr" enable="true">
         <max-channel-count>10</max-channel-count>
         <param name="url" value="http://127.0.0.1:8887/v1/asr/upload"/>
+        <!-- Set stream-url (or UNIMRCP_STREAM_ASR_URL) to enable WebSocket PCM input. -->
+        <!-- <param name="stream-url" value="ws://127.0.0.1:8887/v1/asr/stream"/> -->
         <param name="http-timeout-ms" value="60000"/>
         <param name="max-utterance-ms" value="60000"/>
         <param name="no-input-timeout-ms" value="15000"/>

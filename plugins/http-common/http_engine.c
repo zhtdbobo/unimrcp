@@ -6,6 +6,7 @@
 #include "mrcp_synth_engine.h"
 #include "mrcp_recog_engine.h"
 #include "http_common.h"
+#include "http_stream.h"
 #include <apr_atomic.h>
 #include <apr_queue.h>
 #include <apr_thread_proc.h>
@@ -22,17 +23,19 @@
 #define HP_START SYNTHESIZER_SPEAK
 #define HP_STOP SYNTHESIZER_STOP
 #define HP_ENV "UNIMRCP_HTTP_TTS_URL"
+#define HP_STREAM_ENV "UNIMRCP_STREAM_TTS_URL"
 #else
 #define HP_RESOURCE MRCP_RECOGNIZER_RESOURCE
 #define HP_START RECOGNIZER_RECOGNIZE
 #define HP_STOP RECOGNIZER_STOP
 #define HP_ENV "UNIMRCP_HTTP_ASR_URL"
+#define HP_STREAM_ENV "UNIMRCP_STREAM_ASR_URL"
 #endif
 
 typedef struct {
     const char *url;
     long timeout_ms, max_ms, noinput_ms, silence_ms, activity_ms, threshold;
-    int curl_ready;
+    int curl_ready, streaming;
 } http_engine;
 enum { HP_IDLE, HP_CAPTURING, HP_RECOG_READY, HP_PLAYING, HP_PLAY_DONE, HP_LIMIT };
 typedef struct { mrcp_message_t *request; apr_uint32_t epoch; } http_command;
@@ -47,9 +50,12 @@ typedef struct {
     volatile apr_uint32_t active_epoch;
     mrcp_message_t *active; /* Worker-owned; never touched by the media thread. */
     hp_buffer audio; size_t position;
+    hp_ring ring;
+    hp_stream *transfer; /* Worker-owned; closed before freeing the ring. */
+    int stream_done;
     int paused, input_timers, speech_reported;
     long noinput_ms, silence_ms, max_ms, recognition_ms;
-    size_t run_samples, quiet_samples;
+    size_t run_samples, quiet_samples, total_samples;
     apr_time_t started, timers_started, speech_started;
     char request_id[APR_UUID_FORMATTED_LENGTH+1];
 } http_channel;
@@ -92,8 +98,11 @@ MRCP_PLUGIN_DECLARE(mrcp_engine_t *) mrcp_plugin_create(apr_pool_t *pool)
 }
 static apt_bool_t engine_open(mrcp_engine_t *engine)
 {
-    http_engine *e=engine->obj; const char *url=getenv(HP_ENV); int valid;
+    http_engine *e=engine->obj; const char *url=getenv(HP_ENV), *stream_url=getenv(HP_STREAM_ENV); int valid, valid_url;
     if (!url || !*url) url=mrcp_engine_param_get(engine,"url");
+    if (!stream_url || !*stream_url) stream_url=mrcp_engine_param_get(engine,"stream-url");
+    e->streaming=stream_url && *stream_url;
+    if (e->streaming) url=stream_url;
     e->url=url ? apr_pstrdup(engine->pool,url) : NULL;
     e->timeout_ms=config_number(engine,"http-timeout-ms",60000,1000,180000);
     e->max_ms=config_number(engine,"max-utterance-ms",60000,1000,120000);
@@ -101,7 +110,11 @@ static apt_bool_t engine_open(mrcp_engine_t *engine)
     e->silence_ms=config_number(engine,"speech-complete-timeout-ms",1000,100,10000);
     e->activity_ms=config_number(engine,"min-speech-ms",120,10,1000);
     e->threshold=config_number(engine,"vad-threshold",500,1,32767);
-    valid=e->url && (!strncmp(e->url,"http://",7) || !strncmp(e->url,"https://",8)) &&
+    valid_url=e->url && (!strncmp(e->url,"http://",7) || !strncmp(e->url,"https://",8));
+#ifndef HP_SYNTH
+    if (e->streaming) valid_url=e->url && (!strncmp(e->url,"ws://",5) || !strncmp(e->url,"wss://",6));
+#endif
+    valid=valid_url &&
           e->timeout_ms>0 && e->max_ms>0 && e->noinput_ms>0 && e->silence_ms>0 && e->activity_ms>0 && e->threshold>0;
     if (valid) e->curl_ready=curl_global_init(CURL_GLOBAL_DEFAULT)==CURLE_OK;
     if (!valid || !e->curl_ready) apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"HTTP speech plugin: invalid configuration or CURL initialization failed");
@@ -121,11 +134,35 @@ static int cancelled(void *context)
 }
 static void clear_audio(http_channel *c)
 {
+    hp_stream_close(c->transfer); c->transfer=NULL;
     apr_thread_mutex_lock(c->media_mutex);
     apr_atomic_set32(&c->media_state,HP_IDLE);
     hp_buffer_free(&c->audio); c->position=0; c->paused=0;
+    free(c->ring.data); memset(&c->ring,0,sizeof(c->ring)); c->stream_done=0;
     apr_thread_mutex_unlock(c->media_mutex);
 }
+#ifdef HP_SYNTH
+static int streaming_audio(void *context, const unsigned char *pcm, size_t len)
+{
+    http_channel *c=context; int ok;
+    if (cancelled(c)) return -1;
+    apr_thread_mutex_lock(c->media_mutex);
+    ok=hp_ring_write(&c->ring,pcm,len);
+    apr_thread_mutex_unlock(c->media_mutex);
+    return ok;
+}
+#else
+static size_t streaming_audio(void *context, unsigned char *pcm, size_t cap, int *eof)
+{
+    http_channel *c=context; size_t n;
+    if (cancelled(c) || apr_atomic_read32(&c->media_fault)) return SIZE_MAX;
+    apr_thread_mutex_lock(c->media_mutex);
+    n=hp_ring_read(&c->ring,pcm,cap);
+    *eof=!c->ring.len && apr_atomic_read32(&c->media_state)==HP_RECOG_READY;
+    apr_thread_mutex_unlock(c->media_mutex);
+    return n;
+}
+#endif
 static void reply(http_channel *c, mrcp_message_t *request, mrcp_status_code_e status, mrcp_request_state_e state)
 {
     mrcp_message_t *response=mrcp_response_create(request,request->pool);
@@ -176,6 +213,7 @@ static int plain_content(mrcp_message_t *request)
 static void start_request(http_channel *c, http_command *command)
 {
     mrcp_message_t *r=command->request; const mpf_codec_descriptor_t *codec; apr_uuid_t uuid;
+    unsigned char *ring=NULL;
 #ifdef HP_SYNTH
     hp_buffer pcm={0};
     codec=mrcp_engine_source_stream_codec_get(c->base);
@@ -206,16 +244,27 @@ static void start_request(http_channel *c, http_command *command)
     if (c->noinput_ms<100 || c->noinput_ms>120000 || c->silence_ms<100 || c->silence_ms>10000 || c->recognition_ms<0 || c->recognition_ms>120000) {
         reply(c,r,MRCP_STATUS_CODE_ILLEGAL_PARAM_VALUE,MRCP_REQUEST_STATE_COMPLETE); return;
     }
-    pcm=malloc((size_t)c->max_ms*HP_RATE*2/1000);
-    if (!pcm) { reply(c,r,MRCP_STATUS_CODE_METHOD_FAILED,MRCP_REQUEST_STATE_COMPLETE); return; }
+    pcm=c->engine->streaming ? NULL : malloc((size_t)c->max_ms*HP_RATE*2/1000);
+    if (!pcm && !c->engine->streaming) { reply(c,r,MRCP_STATUS_CODE_METHOD_FAILED,MRCP_REQUEST_STATE_COMPLETE); return; }
 #endif
+    if (c->engine->streaming) {
+        ring=malloc(HP_RING_CAP);
+        if (!ring) { reply(c,r,MRCP_STATUS_CODE_METHOD_FAILED,MRCP_REQUEST_STATE_COMPLETE); return; }
+    }
     clear_audio(c); apr_atomic_set32(&c->active_epoch,command->epoch); c->active=r;
+    c->ring.data=ring; c->ring.cap=ring ? HP_RING_CAP : 0;
     c->started=c->timers_started=apr_time_now(); c->speech_reported=0;
     apr_atomic_set32(&c->speech,0); apr_atomic_set32(&c->media_fault,0);
     apr_uuid_get(&uuid); apr_uuid_format(c->request_id,&uuid);
     reply(c,r,MRCP_STATUS_CODE_SUCCESS,MRCP_REQUEST_STATE_INPROGRESS);
 #ifdef HP_SYNTH
     if (cancelled(c)) return;
+    if (c->engine->streaming) {
+        apr_atomic_set32(&c->media_state,HP_PLAYING);
+        c->transfer=hp_stream_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->engine->timeout_ms,streaming_audio,c);
+        if (!c->transfer) complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0);
+        return;
+    }
     if (!hp_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->engine->timeout_ms,cancelled,c,&pcm)) {
         if (!cancelled(c)) {
             apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"HTTP TTS failed request=%s",c->request_id);
@@ -229,9 +278,13 @@ static void start_request(http_channel *c, http_command *command)
 #else
     apr_thread_mutex_lock(c->media_mutex);
     c->audio.data=pcm; c->audio.cap=c->audio.limit=(size_t)c->max_ms*HP_RATE*2/1000;
-    c->run_samples=c->quiet_samples=0;
+    c->run_samples=c->quiet_samples=c->total_samples=0;
     if (!cancelled(c)) apr_atomic_set32(&c->media_state,HP_CAPTURING);
     apr_thread_mutex_unlock(c->media_mutex);
+    if (c->engine->streaming && !cancelled(c)) {
+        c->transfer=hp_stream_asr(c->engine->url,c->request_id,c->engine->timeout_ms,c->silence_ms,streaming_audio,c);
+        if (!c->transfer) complete(c,RECOGNIZER_COMPLETION_CAUSE_ERROR,NULL,0);
+    }
 #endif
 }
 static void stop_request(http_channel *c, mrcp_message_t *r)
@@ -273,6 +326,17 @@ static void poll_media(http_channel *c)
     if (!c->active || cancelled(c)) return;
     state=apr_atomic_read32(&c->media_state);
 #ifdef HP_SYNTH
+    if (c->transfer) {
+        int status=hp_stream_poll(c->transfer);
+        if (status<0) {
+            apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Streaming TTS failed request=%s",c->request_id);
+            complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0); return;
+        }
+        if (status>0) {
+            hp_stream_close(c->transfer); c->transfer=NULL;
+            apr_thread_mutex_lock(c->media_mutex); c->stream_done=1; apr_thread_mutex_unlock(c->media_mutex);
+        }
+    }
     if (state==HP_PLAY_DONE) complete(c,SYNTHESIZER_COMPLETION_CAUSE_NORMAL,NULL,0);
 #else
     if (apr_atomic_read32(&c->speech) && !c->speech_reported) {
@@ -282,7 +346,26 @@ static void poll_media(http_channel *c)
     }
     if (apr_atomic_read32(&c->media_fault)) { complete(c,RECOGNIZER_COMPLETION_CAUSE_ERROR,NULL,0); return; }
     if (state==HP_LIMIT) { complete(c,RECOGNIZER_COMPLETION_CAUSE_RECOGNITION_TIMEOUT,NULL,0); return; }
-    if (state==HP_RECOG_READY) {
+    if (state==HP_CAPTURING) {
+        apr_time_t now=apr_time_now();
+        int cause=-1;
+        if (!apr_atomic_read32(&c->speech) && c->input_timers && now-c->timers_started>=apr_time_from_msec(c->noinput_ms)) cause=RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT;
+        else if (c->speech_reported && c->recognition_ms && now-c->speech_started>=apr_time_from_msec(c->recognition_ms)) cause=RECOGNIZER_COMPLETION_CAUSE_RECOGNITION_TIMEOUT;
+        else if (now-c->started>=apr_time_from_msec(c->max_ms)) cause=RECOGNIZER_COMPLETION_CAUSE_RECOGNITION_TIMEOUT;
+        if (cause>=0) { complete(c,cause,NULL,0); return; }
+    }
+    if (c->transfer) {
+        int status=hp_stream_poll(c->transfer);
+        if (status) {
+            size_t len=0,i; int nonspace=0; const char *text=hp_stream_text(c->transfer,&len);
+            if (status<0) apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"Streaming ASR failed request=%s",c->request_id);
+            for (i=0;i<len;++i) if (!strchr(" \t\r\n",text[i])) { nonspace=1; break; }
+            complete(c,status<0 ? RECOGNIZER_COMPLETION_CAUSE_ERROR : nonspace ? RECOGNIZER_COMPLETION_CAUSE_SUCCESS : RECOGNIZER_COMPLETION_CAUSE_NO_MATCH,
+                     status>0 && nonspace ? text : NULL,status>0 && nonspace ? len : 0);
+            return;
+        }
+    }
+    if (state==HP_RECOG_READY && !c->engine->streaming) {
         hp_buffer pcm; char *text=NULL; size_t len=0; int ok;
         apr_thread_mutex_lock(c->media_mutex); pcm=c->audio; memset(&c->audio,0,sizeof(c->audio)); apr_atomic_set32(&c->media_state,HP_IDLE); apr_thread_mutex_unlock(c->media_mutex);
         ok=hp_asr(c->engine->url,pcm.data,pcm.len,c->request_id,c->engine->timeout_ms,cancelled,c,&text,&len);
@@ -294,11 +377,6 @@ static void poll_media(http_channel *c)
             complete(c,!ok ? RECOGNIZER_COMPLETION_CAUSE_ERROR : nonspace ? RECOGNIZER_COMPLETION_CAUSE_SUCCESS : RECOGNIZER_COMPLETION_CAUSE_NO_MATCH,nonspace?text:NULL,nonspace?len:0);
         }
         free(text);
-    } else if (state==HP_CAPTURING) {
-        apr_time_t now=apr_time_now();
-        if (!apr_atomic_read32(&c->speech) && c->input_timers && now-c->timers_started>=apr_time_from_msec(c->noinput_ms)) complete(c,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT,NULL,0);
-        else if (c->speech_reported && c->recognition_ms && now-c->speech_started>=apr_time_from_msec(c->recognition_ms)) complete(c,RECOGNIZER_COMPLETION_CAUSE_RECOGNITION_TIMEOUT,NULL,0);
-        else if (now-c->started>=apr_time_from_msec(c->max_ms)) complete(c,RECOGNIZER_COMPLETION_CAUSE_RECOGNITION_TIMEOUT,NULL,0);
     }
 #endif
 }
@@ -311,7 +389,8 @@ static void *APR_THREAD_FUNC channel_worker(apr_thread_t *thread, void *context)
         status=apr_queue_trypop(c->commands,&item);
         apr_thread_mutex_unlock(c->command_mutex);
         if (status==APR_SUCCESS) { dispatch(c,item); free(item); }
-        else { poll_media(c); apr_sleep(apr_time_from_msec(5)); }
+        poll_media(c);
+        if (status!=APR_SUCCESS) apr_sleep(apr_time_from_msec(5));
     }
     clear_audio(c); c->active=NULL;
     while (apr_queue_trypop(c->commands,&item)==APR_SUCCESS) {
@@ -389,7 +468,11 @@ static apt_bool_t stream_read(mpf_audio_stream_t *stream, mpf_frame_t *frame)
     if (apr_atomic_read32(&c->media_state)!=HP_PLAYING || cancelled(c)) return TRUE;
     if (apr_thread_mutex_trylock(c->media_mutex)!=APR_SUCCESS) return TRUE;
     if (apr_atomic_read32(&c->media_state)==HP_PLAYING && !cancelled(c) && !c->paused) {
-        if (c->position==c->audio.len) apr_atomic_set32(&c->media_state,HP_PLAY_DONE);
+        if (c->engine->streaming) {
+            if (!c->ring.len && c->stream_done) apr_atomic_set32(&c->media_state,HP_PLAY_DONE);
+            else hp_ring_read(&c->ring,frame->codec_frame.buffer,n);
+        }
+        else if (c->position==c->audio.len) apr_atomic_set32(&c->media_state,HP_PLAY_DONE);
         else {
             if (n>c->audio.len-c->position) n=c->audio.len-c->position;
             memcpy(frame->codec_frame.buffer,c->audio.data+c->position,n); c->position+=n;
@@ -405,8 +488,11 @@ static apt_bool_t stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *fr
     if (apr_thread_mutex_trylock(c->media_mutex)!=APR_SUCCESS) { apr_atomic_set32(&c->media_fault,1); return TRUE; }
     if (apr_atomic_read32(&c->media_state)!=HP_CAPTURING || cancelled(c)) { apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
     if (n%2) { apr_atomic_set32(&c->media_fault,1); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
-    if (n>c->audio.cap-c->audio.len) { apr_atomic_set32(&c->media_state,HP_LIMIT); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
-    memcpy(c->audio.data+c->audio.len,bytes,n); c->audio.len+=n;
+    if (c->total_samples+samples>(size_t)c->max_ms*HP_RATE/1000) { apr_atomic_set32(&c->media_state,HP_LIMIT); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
+    if (c->engine->streaming) {
+        if (!hp_ring_write(&c->ring,bytes,n)) { apr_atomic_set32(&c->media_fault,1); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
+    } else { memcpy(c->audio.data+c->audio.len,bytes,n); c->audio.len+=n; }
+    c->total_samples+=samples;
     for (i=0;i<n;i+=2) { int16_t s; int32_t v; memcpy(&s,bytes+i,2); v=s; energy+=(uint64_t)((int64_t)v*v); }
     if (energy>=(uint64_t)c->engine->threshold*c->engine->threshold*samples) {
         c->run_samples+=samples;

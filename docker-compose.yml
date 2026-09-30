@@ -13,6 +13,8 @@ services:
     environment:
       UNIMRCP_HTTP_ASR_URL: "${UNIMRCP_HTTP_ASR_URL:-http://127.0.0.1:8887/v1/asr/upload}"
       UNIMRCP_HTTP_TTS_URL: "${UNIMRCP_HTTP_TTS_URL:-http://127.0.0.1:8889/api/v1/tts}"
+      UNIMRCP_STREAM_ASR_URL: "${UNIMRCP_STREAM_ASR_URL:-}"
+      UNIMRCP_STREAM_TTS_URL: "${UNIMRCP_STREAM_TTS_URL:-}"
     volumes:
       - type: bind
         source: ./conf/unimrcpserver-http.xml

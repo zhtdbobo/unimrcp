@@ -15,6 +15,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,6 +24,7 @@ import wave
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
+PREFIX = Path(os.environ.get('UNIMRCP_TEST_PREFIX', '/opt/unimrcp'))
 RATE = 16000
 PCM = struct.pack('<'+'h'*3200, *(int(6000*math.sin(i*2*math.pi*440/RATE)) for i in range(3200)))
 ASR_MODE = 'ok'
@@ -291,28 +293,26 @@ def exercise(sip):
     assert not HTTP_ERRORS, HTTP_ERRORS
     print('PASS: concurrent sessions, close during HTTP, fresh session after delayed response', flush=True)
 
-def main():
-    cflags=subprocess.check_output(['pkg-config','--cflags','libcurl','json-c'],text=True).split()
-    libs=subprocess.check_output(['pkg-config','--libs','libcurl','json-c'],text=True).split()
-    # Keep ASan's executable mapping stable under WSL address randomization.
-    subprocess.run(['cc','-Wall','-Wextra','-Werror','-g','-no-pie','-fsanitize=address,undefined','-Iplugins/http-common',*cflags,
-                    'tests/http-plugins/test_common.c','plugins/http-common/http_common.c',*libs,'-o','/tmp/test-http-common'],check=True,cwd=ROOT)
-    subprocess.run(['/tmp/test-http-common'],check=True)
-    upstream=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream)
-    threading.Thread(target=upstream.serve_forever,daemon=True).start()
+def run_server(tts_url, asr_url, exercise, streaming=False):
     tmp=Path(tempfile.mkdtemp(prefix='unimrcp-http-test-'))
-    shutil.copytree('/opt/unimrcp/conf',tmp/'conf')
-    (tmp/'plugin').symlink_to('/opt/unimrcp/plugin')
+    shutil.copytree(PREFIX/'conf',tmp/'conf')
+    (tmp/'plugin').symlink_to(PREFIX/'plugin')
     for name in ('data','log','var'):
         (tmp/name).mkdir()
     sip, mrcp = free_port(), free_port()
     tree=ET.parse(ROOT/'conf/unimrcpserver-http.xml')
     tree.find('.//sip-port').text=str(sip); tree.find('.//mrcp-port').text=str(mrcp)
+    if streaming:
+        for param in tree.findall('.//engine/param[@name="http-timeout-ms"]'):
+            param.set('value', '2500')
     tree.write(tmp/'conf/unimrcpserver.xml',encoding='utf-8',xml_declaration=True)
-    env=dict(os.environ,UNIMRCP_HTTP_TTS_URL=f'http://127.0.0.1:{upstream.server_port}/tts',UNIMRCP_HTTP_ASR_URL=f'http://127.0.0.1:{upstream.server_port}/asr')
+    env=dict(os.environ,UNIMRCP_HTTP_TTS_URL=tts_url,UNIMRCP_HTTP_ASR_URL=asr_url,
+             UNIMRCP_STREAM_TTS_URL=tts_url if streaming else '',UNIMRCP_STREAM_ASR_URL=asr_url if streaming else '')
+    # Requests must go directly to the configured voice gateways.
+    env.update(http_proxy='http://127.0.0.1:9', https_proxy='http://127.0.0.1:9', no_proxy='')
     logfile=tmp/'server-console.log'
     with logfile.open('w') as log:
-        process=subprocess.Popen(['stdbuf','-oL','-eL','/opt/unimrcp/bin/unimrcpserver','-r',str(tmp)],stdin=subprocess.PIPE,stdout=log,stderr=log,env=env)
+        process=subprocess.Popen(['stdbuf','-oL','-eL',str(PREFIX/'bin/unimrcpserver'),'-r',str(tmp)],stdin=subprocess.PIPE,stdout=log,stderr=log,env=env)
         try:
             for _ in range(100):
                 assert process.poll() is None, f'Server exited {process.returncode}'
@@ -337,9 +337,24 @@ def main():
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill(); process.wait()
-            upstream.shutdown()
     assert process.returncode==0, f'Non-clean shutdown: {process.returncode}'
     print('PASS: clean server shutdown',flush=True)
+
+def main():
+    cflags=subprocess.check_output(['pkg-config','--cflags','libcurl','json-c','libwebsockets'],text=True).split()
+    libs=subprocess.check_output(['pkg-config','--libs','libcurl','json-c','libwebsockets'],text=True).split()
+    # Keep ASan's executable mapping stable under WSL address randomization.
+    subprocess.run(['cc','-Wall','-Wextra','-Werror','-g','-no-pie','-fsanitize=address,undefined','-Iplugins/http-common',*cflags,
+                    'tests/http-plugins/test_common.c','plugins/http-common/http_common.c','plugins/http-common/http_stream.c',
+                    *libs,'-o','/tmp/test-http-common'],check=True,cwd=ROOT)
+    subprocess.run(['/tmp/test-http-common'],check=True)
+    upstream=http.server.ThreadingHTTPServer(('127.0.0.1',0),Upstream)
+    threading.Thread(target=upstream.serve_forever,daemon=True).start()
+    try:
+        run_server(f'http://127.0.0.1:{upstream.server_port}/tts',f'http://127.0.0.1:{upstream.server_port}/asr',exercise)
+    finally:
+        upstream.shutdown(); upstream.server_close()
+    subprocess.run([sys.executable,str(ROOT/'tests/http-plugins/test_streaming.py')],check=True)
 
 if __name__=='__main__':
     main()

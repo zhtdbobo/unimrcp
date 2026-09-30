@@ -23,7 +23,7 @@ option (ENABLE_HTTP_TTS_PLUGIN "Enable HTTP TTS adapter" OFF)
 option (ENABLE_HTTP_ASR_PLUGIN "Enable HTTP ASR adapter" OFF)
 if (ENABLE_HTTP_TTS_PLUGIN OR ENABLE_HTTP_ASR_PLUGIN)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(HTTP_SPEECH REQUIRED libcurl>=7.56 json-c>=0.15)
+    pkg_check_modules(HTTP_SPEECH REQUIRED libcurl>=7.56 json-c>=0.15 libwebsockets>=4.1)
 endif ()
 
 # Organize targets into folders

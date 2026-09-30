@@ -10,11 +10,14 @@
 |---|---|---|
 | httptts | POST JSON `{text, format:"wav", sample_rate:16000}`，返回 WAV 二进制 | 16 kHz PCM16 WAV；单声道或双声道，双声道取均值；输出单声道 |
 | httpasr | POST multipart：`file` WAV，`format=wav`，`sample_rate=16000`，`language_hints=zh`；返回 `{"text":"..."}` | 收集 16 kHz 单声道 PCM，停顿后封装完整 WAV |
+| httptts 流式 | POST `/api/v1/tts/stream`，JSON `{text, format:"pcm", sample_rate:16000}`；返回 `audio/pcm` | 每块 PCM 到达后进入 RTP 播放缓冲，不等待完整响应 |
+| httpasr 流式 | WebSocket `/v1/asr/stream`，`start → started → 二进制 PCM → finish → completed` | 收音期间持续上传 PCM，并同步接收结果；使用 `completed.text` 生成 NLSML |
 
 每个 HTTP 请求携带随机 `X-Request-ID`。插件自身只记录该标识和错误类别，不记录文本、音频或 URL。
 环境代理不参与请求；不跟随重定向；HTTPS 保留 libcurl 默认的证书和主机名验证。
 
-此版本按整句处理。TTS 必须完整接收并验证 WAV 后才输出，不提供流式模型推理。
+不配置 `stream-url` 时沿用完整 WAV 模式。配置后使用同级 `Asr/realtime.py` 和 `Tts/main.py` 提供的实时接口，启用方法见 3.5 节。
+流式 TTS 一次提交完整文本，边合成边播放；同一个 SPEAK 请求不能持续追加文本。流式 ASR 会消费中间结果和句末结果，但 MRCP 只在整个识别任务完成后发送最终 NLSML，不把修订中的文字当作完成结果。
 仅接受 MRCP TTS `text/plain`；音色和模型沿用 HTTP 服务默认值。ASR 仅支持 `builtin:speech/transcribe` 转写，输出 NLSML。
 未实现 SRGS、SSML、波形存档、GET/SET-PARAMS、自定义音色、选择性 STOP 请求 ID 列表及排队合成；不支持的方法返回错误，不伪装成功。
 支持全通道 STOP、TTS PAUSE/RESUME/BARGE-IN-OCCURRED，以及 ASR START-INPUT-TIMERS。
@@ -22,7 +25,7 @@
 
 TTS 最大 25 MiB，文本最大 80 KiB。严格校验 WAV 容器长度、格式、音频帧完整性，拒绝其他采样率。
 仅兼容既有 TTS 网关的标准 44 字节 WAV 头占位值：RIFF `0x7FFFFFBF`、data `0x7FFFFF9B`；普通截断文件不会被当作有效音频。
-ASR 空文字映射为 no-match，服务失败映射为 error，无输入不会调用 HTTP。
+ASR 空文字映射为 no-match，服务失败映射为 error。完整 WAV 模式无输入不会调用 HTTP；流式模式在 RECOGNIZE 时建立 WebSocket，无输入超时会关闭连接。
 VAD 是 PCM 能量与持续时间检测，需按实际电话音质调参，不代表噪声环境下的人声分类模型。
 
 ## 2. 构建与测试（Linux / amd64）
@@ -37,7 +40,7 @@ wslc run --rm local/unimrcp-http:1.8.0
 Docker 用户可将 `wslc` 换成 `docker`。测试镜像包含编译器和测试程序，适合开发验证，不是精简生产镜像。
 测试使用容器内模拟 HTTP 接口、实际 UniMRCP Server、SIP/MRCP 控制连接和 RTP 音频，不会拨打真实电话或访问你的实际语音服务。
 
-Linux 原生构建依赖：带 UniMRCP 补丁的 APR、匹配的 APR-util、Sofia-SIP、Autotools、libcurl >= 7.56、json-c >= 0.15。
+Linux 原生构建依赖：带 UniMRCP 补丁的 APR、匹配的 APR-util、Sofia-SIP、Autotools、libcurl >= 7.56、json-c >= 0.15、libwebsockets >= 4.1。Debian 的新增开发依赖为 `libwebsockets-dev`；流式协议测试还需要 `python3-websockets`。
 系统自带 APR 缺少 `apr_pool_mutex_set`，不能直接替代官方配套版本。测试 Dockerfile 下载官方 `unimrcp-deps-1.6.0` 源码包，校验 SHA256 后把 APR/APR-util 安装到 `/opt/unimrcp-deps`；没有删除这项线程安全功能来绕过链接错误。
 Debian 12 的基础包名和完整构建步骤见测试 Dockerfile。安装配套 APR 后的构建示例：
 
@@ -83,7 +86,8 @@ export UNIMRCP_HTTP_TTS_URL=http://实际可达的语音服务地址:8889/api/v1
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
-| http-timeout-ms | 60000 | HTTP 总超时；连接超时固定 5000 ms |
+| stream-url | 未设置 | 非空即启用该引擎的流式模式，优先于 `url`；TTS 为 HTTP(S)，ASR 为 WS(S) |
+| http-timeout-ms | 60000 | HTTP 总超时 / ASR WebSocket 整个任务的超时，包含收音、等待结果和 TTS 背压暂停；HTTP 连接超时 5000 ms |
 | max-utterance-ms | 60000 | ASR 一轮收音的时长和内存上限，最多 120000 ms |
 | no-input-timeout-ms | 15000 | 没检测到讲话的超时 |
 | speech-complete-timeout-ms | 1000 | 讲话后的尾静音时长 |
@@ -91,7 +95,7 @@ export UNIMRCP_HTTP_TTS_URL=http://实际可达的语音服务地址:8889/api/v1
 | vad-threshold | 500 | PCM16 的 RMS 幅度阈值 |
 
 示例限制每个引擎最多 10 个通道；这不是容量测试结论，也不会解除现有 Call 控制器的一通电话限制。
-每个通道有独立 HTTP 工作线程和有界音频缓冲；音频回调不执行 HTTP、不分配内存。
+每个通道有独立工作线程和有界音频缓冲；音频回调不执行网络操作、不分配内存。流式模式使用 2 MiB 环形缓冲，TTS 缓冲满时暂停网络读取，ASR 缓冲溢出时返回 error。TTS 临时缺数据时输出静音，只有上游正常结束且缓冲播放完毕后才发送 SPEAK-COMPLETE；奇数字节结尾、HTTP 传输中断、错误媒体类型均返回 error。流式音频已经播放的部分不能撤回。
 
 ### 3.1 使用 Docker Compose 启动已有镜像
 
@@ -208,6 +212,33 @@ docker cp unimrcp-http-unimrcp-1:/tmp/unimrcp-check.wav ./unimrcp-check.wav
 
 本地用原镜像、真实 UniMRCP 进程及模拟 HTTP 上游验证了此客户端的成功路径、慢 TTS、TTS HTTP 错误、ASR 非法响应；错误场景均返回非零，服务端保持运行。服务器执行时会使用其真实模型地址。该检查覆盖 UniMRCP 服务端链路，FreeSWITCH 客户端及实际电话音频仍按第 4 节联调。
 
+### 3.5 启用已有模型服务的实时接口
+
+需要重新编译两个插件并部署新镜像；旧 `local/unimrcp-http:1.8.0` 镜像不会因为新增环境变量就获得流式能力。在仓库根目录构建和运行测试：
+
+```sh
+docker build -f tests/http-plugins/Dockerfile -t local/unimrcp-http:1.8.0-stream .
+docker run --rm --network none local/unimrcp-http:1.8.0-stream
+```
+
+已有服务器模型端口为 ASR 5004、TTS 5005 时，在 Compose 的 `.env` 中增加：
+
+```dotenv
+UNIMRCP_IMAGE=local/unimrcp-http:1.8.0-stream
+UNIMRCP_STREAM_ASR_URL=ws://127.0.0.1:5004/v1/asr/stream
+UNIMRCP_STREAM_TTS_URL=http://127.0.0.1:5005/api/v1/tts/stream
+```
+
+将更新后的 `docker-compose.yml` 一同部署，再执行 `docker compose up -d --force-recreate`。单个变量非空只启用对应资源的流式模式；两个变量均为空且 XML 未设置 `stream-url` 时使用原完整 WAV 接口。也可取消 XML 中相应 `stream-url` 的注释。环境变量优先于 XML；如需回退，同时移除 XML 中的流式地址。
+
+ASR 开始消息固定使用 PCM、16000 Hz、`language_hints:["zh"]`。本地能量 VAD 仍负责 MRCP 的 START-OF-INPUT 和尾静音判停；收音结束后发 `finish` 并等待 `completed`。网关的 `max_sentence_silence` 使用 MRCP 的 Speech-Complete-Timeout 并限制在网关允许的 200–6000 ms。句子结果和最终全文可能有修订，插件仅采用最终全文。
+
+设置 `http-timeout-ms` 时需覆盖整轮收音及等待结果；如果 `max-utterance-ms` 设为 60000，可将前者设为 90000 留出连接和识别余量。STOP、BARGE-IN-OCCURRED 和通道关闭会终止当前传输，后续结果不会交给下一轮。TTS PAUSE/RESUME、ASR START-INPUT-TIMERS 在流式传输期间可处理。
+
+`tests/http-plugins/test_streaming.py` 使用与上述两个项目一致的模拟接口，验证首段 RTP 在 HTTP 结束前到达、ASR 音频在收音结束前上传、JSON 分片、PCM 采样跨 HTTP 块、缓冲背压、传输中断、超时、取消、通道复用与并发。真实模型部署后，可继续用 3.4 节的客户端做完整链路检查；该客户端本身只测整轮结果，不单独证明首包延迟。
+
+WebSocket 收发使用 [libwebsockets 客户端 API](https://libwebsockets.org/lws-api-doc-main/html/group__client.html)，TTS 使用 libcurl multi 驱动增量响应。
+
 ## 4. FreeSWITCH 联调前提
 
 FreeSWITCH 镜像还需编译安装 `mod_unimrcp` 及对应客户端依赖。仅启动此 Server 不会切换原有 Call 流程。
@@ -221,6 +252,20 @@ ASR 使用转写 URI，并设置 `define-grammar=false`，避免让客户端先�
 Call 侧后续还需调整 ESL 事件订阅、前端判停、SFTP 就绪检查和文件式 TTS 缓存；本次没有替换正在使用的业务链路。
 
 ## 5. 验证与来源
+
+### 2026-09-30 流式版本验证
+
+已对照同级 `Asr/realtime.py`、`Asr/docs/API.md`、`Tts/main.py`、`Tts/docs/API.md` 接入实时协议。在 WSL 的临时 Debian 12 文件系统中，基于已有测试镜像补充 libwebsockets 4.1.6，完成两个插件及 UniMRCP Server 的编译、安装和实际 SIP/MRCP/RTP 测试。
+
+- WAV/PCM、NLSML 和环形缓冲单元测试通过 ASan/UBSan；新传输层通过 `-Wall -Wextra -Werror` 编译检查。
+- 原完整 WAV 模式的全部回归通过。
+- 流式 TTS 在 HTTP EOF 前播放；跨块 PCM 采样、临时断流、背压、PAUSE/RESUME、STOP、BARGE-IN-OCCURRED、错误类型、奇数字节结尾和截断响应处理通过。
+- 流式 ASR 在收音结束前上传；分片 JSON、ping、中间结果修订、最终全文、空结果、非法/过大消息、断线、启动/结束超时、无输入、输入计时器和识别超时处理通过。
+- 环境 HTTP 代理禁用、重定向拒绝、ASR/TTS 并发通道、取消后复用、传输中关闭及服务正常退出通过。
+
+最终测试日志：`dist/stream-final-test.log`，完整测试返回 0。模型上游使用与现有服务协议一致的模拟接口；真实模型和 FreeSWITCH 电话仍需部署后联调。本机 WSLC 返回 `0x8007273d`，因此本次未生成新的 Docker 镜像归档；上面的源码构建与协议测试已在临时 Linux 环境完成，运行中的服务未改动。
+
+### 原 HTTP 版本的验证记录
 
 测试入口 `tests/http-plugins/test_integration.py` 包含 WAV/JSON 格式与大小校验、真实协议交互、HTTP 失败、无声、STOP、同通道复用、并行通道、HTTP 进行中关闭及正常服务关闭。
 测试 HTTP 服务为模拟服务；通过测试不等同于真实模型和 FreeSWITCH 已完成联调。
