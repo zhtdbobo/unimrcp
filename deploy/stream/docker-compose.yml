@@ -1,0 +1,39 @@
+name: unimrcp-stream
+
+services:
+  unimrcp:
+    # This is the tag stored in unimrcp-http-20261008.tar.
+    image: "${UNIMRCP_IMAGE:-unimrcp-http:20061008}"
+    container_name: unimrcp-stream
+    platform: linux/amd64
+    pull_policy: never
+    restart: unless-stopped
+    network_mode: host
+    stop_grace_period: 30s
+    environment:
+      # Require both URLs so this instance always enables streaming.
+      UNIMRCP_STREAM_ASR_URL: "${UNIMRCP_STREAM_ASR_URL:?Set UNIMRCP_STREAM_ASR_URL in .env}"
+      UNIMRCP_STREAM_TTS_URL: "${UNIMRCP_STREAM_TTS_URL:?Set UNIMRCP_STREAM_TTS_URL in .env}"
+    volumes:
+      - type: bind
+        source: ./conf/unimrcpserver-http.xml
+        target: /opt/unimrcp/conf/unimrcpserver.xml
+        read_only: true
+        bind:
+          create_host_path: false
+    # The image defaults to running tests; start the server instead.
+    command:
+      - stdbuf
+      - -oL
+      - -eL
+      - /opt/unimrcp/bin/unimrcpserver
+      - -r
+      - /opt/unimrcp
+      - -w
+      - -o
+      - "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

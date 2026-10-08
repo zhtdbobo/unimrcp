@@ -13,6 +13,7 @@
 dist/
 # /
 /.env
+/deploy/stream/.env
 /debug
 /release
 /Debug

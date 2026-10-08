@@ -239,6 +239,48 @@ ASR 开始消息固定使用 PCM、16000 Hz、`language_hints:["zh"]`。本地�
 
 WebSocket 收发使用 [libwebsockets 客户端 API](https://libwebsockets.org/lws-api-doc-main/html/group__client.html)，TTS 使用 libcurl multi 驱动增量响应。
 
+### 3.6 并行部署第二套流式服务
+
+`deploy/stream/` 提供独立的 Compose、环境变量示例和 XML，可整体复制到服务器 `/opt/unimrcp-stream/`。ASR/TTS 模型服务仍使用服务器的 5004/5005 端口，两套 UniMRCP 可以共用它们。
+
+| 配置 | 原有完整 WAV 服务 | 第二套流式服务 |
+|---|---|---|
+| Compose 项目名 | unimrcp-http | unimrcp-stream |
+| 镜像 | local/unimrcp-http:1.8.0 | unimrcp-http:20061008 |
+| SIP | 8060 | 8061 |
+| MRCP | 1544 | 1545 |
+| RTSP | 1554 | 1555 |
+| RTP | 25000–25100 | 25200–25300 |
+
+`dist/unimrcp-http-20261008.tar` 的 manifest 中实际标签是 `unimrcp-http:20061008`；文件名不会决定镜像标签。包内 `httpasr`、`httptts` 插件包含流式入口。将镜像包也上传到新目录，目录结构为：
+
+```text
+/opt/unimrcp-stream/
+├── docker-compose.yml
+├── .env.example
+├── conf/
+│   └── unimrcpserver-http.xml
+└── unimrcp-http-20261008.tar
+```
+
+首次部署执行：
+
+```sh
+cd /opt/unimrcp-stream
+docker load -i unimrcp-http-20261008.tar
+cp .env.example .env
+# 按模型所在机器修改 .env 的地址；按客户端网络修改 XML 的 properties/ip。
+docker compose -p unimrcp-stream config --quiet
+docker compose -p unimrcp-stream up -d
+docker compose -p unimrcp-stream logs --tail 100 -f unimrcp
+```
+
+Compose 要求两个流式 URL 都非空；省略或清空时会在配置检查阶段报错。新 XML 的 ASR 总超时为 90000 ms，为最多 60000 ms 收音保留等待结果的时间。端口已与仓库的旧配置错开；部署时还需确认这些端口没有被服务器其他服务占用。host 网络直接使用 XML 中的监听端口，无需添加 `ports`。
+
+新 XML 默认 IP 为 `127.0.0.1`，适用于同机且共享宿主机网络的客户端；远程或 bridge 网络客户端需要使用服务器可达的网卡 IP。FreeSWITCH 为流式服务新增一个 profile，连接 SIP **8061**，并让客户端自身的 SIP/RTP 端口避开这两套服务。业务侧选择 profile 来决定使用哪套，自动故障切换需另行实现。
+
+更新这套服务的 `.env` 或 XML 后，在新目录执行 `docker compose -p unimrcp-stream up -d --force-recreate`。这里只提供部署配置；实际模型和 FreeSWITCH 通话仍需在服务器联调。
+
 ## 4. FreeSWITCH 联调前提
 
 FreeSWITCH 镜像还需编译安装 `mod_unimrcp` 及对应客户端依赖。仅启动此 Server 不会切换原有 Call 流程。
