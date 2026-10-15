@@ -28,13 +28,22 @@ int hp_buffer_append(hp_buffer *b, const void *data, size_t len)
     b->len+=len; return 1;
 }
 
-int hp_wav_encode(const unsigned char *pcm, size_t len, hp_buffer *wav)
+int hp_rate_valid(int rate) { return rate==8000 || rate==16000; }
+
+int hp_wav_header(unsigned char h[44], size_t len, int rate)
 {
-    unsigned char h[44]={0}; size_t i;
-    if (!len || len%2 || len > HP_MAX_AUDIO-44) return 0;
+    if (!hp_rate_valid(rate) || len%2 || len>HP_MAX_AUDIO-44) return 0;
+    memset(h,0,44);
     memcpy(h,"RIFF",4); put32(h+4,(uint32_t)len+36); memcpy(h+8,"WAVEfmt ",8);
-    put32(h+16,16); put16(h+20,1); put16(h+22,1); put32(h+24,HP_RATE);
-    put32(h+28,HP_RATE*2); put16(h+32,2); put16(h+34,16); memcpy(h+36,"data",4); put32(h+40,(uint32_t)len);
+    put32(h+16,16); put16(h+20,1); put16(h+22,1); put32(h+24,(uint32_t)rate);
+    put32(h+28,(uint32_t)rate*2); put16(h+32,2); put16(h+34,16); memcpy(h+36,"data",4); put32(h+40,(uint32_t)len);
+    return 1;
+}
+
+int hp_wav_encode(const unsigned char *pcm, size_t len, int rate, hp_buffer *wav)
+{
+    unsigned char h[44]; size_t i;
+    if (!len || !hp_wav_header(h,len,rate)) return 0;
     wav->limit=HP_MAX_AUDIO;
     if (!hp_buffer_append(wav,h,44) || !hp_buffer_append(wav,pcm,len)) return 0;
     /* MPF LPCM is host endian; RIFF PCM is little endian. */
@@ -44,10 +53,10 @@ int hp_wav_encode(const unsigned char *pcm, size_t len, hp_buffer *wav)
     return 1;
 }
 
-int hp_wav_decode(const unsigned char *wav, size_t len, hp_buffer *pcm)
+int hp_wav_decode(const unsigned char *wav, size_t len, int rate, hp_buffer *pcm)
 {
     size_t pos=12, n, data_pos=0, data_len=0, i; unsigned channels=0; int fmt=0, placeholder=0;
-    if (len<44 || len>HP_MAX_AUDIO || memcmp(wav,"RIFF",4) || memcmp(wav+8,"WAVE",4)) return 0;
+    if (!hp_rate_valid(rate) || len<44 || len>HP_MAX_AUDIO || memcmp(wav,"RIFF",4) || memcmp(wav+8,"WAVE",4)) return 0;
     /* Only the exact streaming placeholder pair observed in the existing TTS gateway. */
     placeholder=u32(wav+4)==0x7fffffbf && !memcmp(wav+12,"fmt ",4) && u32(wav+16)==16 &&
                 !memcmp(wav+36,"data",4) && u32(wav+40)==0x7fffff9b;
@@ -57,9 +66,9 @@ int hp_wav_decode(const unsigned char *wav, size_t len, hp_buffer *pcm)
         if (placeholder && pos==36) n=len-44;
         if (n>len-pos-8) return 0;
         if (!memcmp(wav+pos,"fmt ",4)) {
-            if (fmt || n<16 || u16(wav+pos+8)!=1 || u16(wav+pos+22)!=16 || u32(wav+pos+12)!=HP_RATE) return 0;
+            if (fmt || n<16 || u16(wav+pos+8)!=1 || u16(wav+pos+22)!=16 || u32(wav+pos+12)!=(uint32_t)rate) return 0;
             channels=u16(wav+pos+10);
-            if ((channels!=1 && channels!=2) || u16(wav+pos+20)!=channels*2 || u32(wav+pos+16)!=HP_RATE*channels*2) return 0;
+            if ((channels!=1 && channels!=2) || u16(wav+pos+20)!=channels*2 || u32(wav+pos+16)!=(uint32_t)rate*channels*2) return 0;
             fmt=1;
         } else if (!memcmp(wav+pos,"data",4)) {
             if (data_pos || !n) return 0;
@@ -69,7 +78,7 @@ int hp_wav_decode(const unsigned char *wav, size_t len, hp_buffer *pcm)
     }
     if (!fmt || !data_pos || pos!=len || data_len%(channels*2)) return 0;
     pcm->limit=HP_MAX_AUDIO;
-    /* Downmix 16-kHz stereo using a 32-bit sum. Do not silently resample other rates. */
+    /* Downmix stereo using a 32-bit sum. Never relabel a different sample rate. */
     for (i=0;i<data_len;i+=channels*2) {
         int32_t s=(int16_t)u16(wav+data_pos+i); int16_t sample;
         if (channels==2) s=(s+(int16_t)u16(wav+data_pos+i+2))/2;
@@ -146,21 +155,21 @@ static int perform(CURL *curl, struct curl_slist *headers)
     return rc==CURLE_OK && status>=200 && status<300;
 }
 
-int hp_tts(const char *url, const char *text, size_t len, const char *id, long timeout,
+int hp_tts(const char *url, const char *text, size_t len, const char *id, int rate, long timeout,
            hp_cancel_fn cancel, void *context, hp_buffer *pcm)
 {
     hp_transfer t={{0},cancel,context}; struct curl_slist *headers=NULL,*next; CURL *curl=NULL;
     struct json_object *json=NULL; int ok=0;
-    if (!len || len>HP_MAX_TEXT || memchr(text,0,len)) return 0;
+    if (!hp_rate_valid(rate) || !len || len>HP_MAX_TEXT || memchr(text,0,len)) return 0;
     t.body.limit=HP_MAX_AUDIO;
     curl=prepare(url,id,timeout,&t,&headers); if (!curl) goto done;
     next=curl_slist_append(headers,"Content-Type: application/json"); if (!next) goto done; headers=next;
     json=json_object_new_object(); if (!json) goto done;
     json_object_object_add(json,"text",json_object_new_string_len(text,(int)len));
     json_object_object_add(json,"format",json_object_new_string("wav"));
-    json_object_object_add(json,"sample_rate",json_object_new_int(HP_RATE));
+    json_object_object_add(json,"sample_rate",json_object_new_int(rate));
     curl_easy_setopt(curl,CURLOPT_POSTFIELDS,json_object_to_json_string_ext(json,JSON_C_TO_STRING_PLAIN));
-    if (perform(curl,headers) && !(cancel && cancel(context))) ok=hp_wav_decode(t.body.data,t.body.len,pcm);
+    if (perform(curl,headers) && !(cancel && cancel(context))) ok=hp_wav_decode(t.body.data,t.body.len,rate,pcm);
 done:
     if (curl) curl_easy_cleanup(curl);
     curl_slist_free_all(headers); if (json) json_object_put(json); hp_buffer_free(&t.body);
@@ -168,21 +177,22 @@ done:
     return ok;
 }
 
-int hp_asr(const char *url, const unsigned char *pcm, size_t len, const char *id, long timeout,
+int hp_asr(const char *url, const unsigned char *pcm, size_t len, const char *id, int rate, long timeout,
            hp_cancel_fn cancel, void *context, char **text, size_t *text_len)
 {
     hp_transfer t={{0},cancel,context}; hp_buffer wav={0}; struct curl_slist *headers=NULL; CURL *curl=NULL;
     curl_mime *mime=NULL; curl_mimepart *part; struct json_tokener *tok=NULL;
-    struct json_object *root=NULL,*value=NULL; int ok=0; size_t used;
+    struct json_object *root=NULL,*value=NULL; int ok=0; size_t used; char rate_text[16];
     *text=NULL; *text_len=0; t.body.limit=1024*1024;
-    if (!hp_wav_encode(pcm,len,&wav)) goto done;
+    if (!hp_wav_encode(pcm,len,rate,&wav)) goto done;
+    snprintf(rate_text,sizeof(rate_text),"%d",rate);
     curl=prepare(url,id,timeout,&t,&headers); if (!curl) goto done;
     mime=curl_mime_init(curl); if (!mime) goto done;
     part=curl_mime_addpart(mime); if (!part) goto done;
     curl_mime_name(part,"file"); curl_mime_filename(part,"utterance.wav"); curl_mime_type(part,"audio/wav");
     if (curl_mime_data(part,(const char *)wav.data,wav.len)!=CURLE_OK) goto done;
     part=curl_mime_addpart(mime); if (!part) goto done; curl_mime_name(part,"format"); curl_mime_data(part,"wav",CURL_ZERO_TERMINATED);
-    part=curl_mime_addpart(mime); if (!part) goto done; curl_mime_name(part,"sample_rate"); curl_mime_data(part,"16000",CURL_ZERO_TERMINATED);
+    part=curl_mime_addpart(mime); if (!part) goto done; curl_mime_name(part,"sample_rate"); curl_mime_data(part,rate_text,CURL_ZERO_TERMINATED);
     part=curl_mime_addpart(mime); if (!part) goto done; curl_mime_name(part,"language_hints"); curl_mime_data(part,"zh",CURL_ZERO_TERMINATED);
     curl_easy_setopt(curl,CURLOPT_MIMEPOST,mime);
     if (!perform(curl,headers) || (cancel && cancel(context)) || !t.body.len) goto done;

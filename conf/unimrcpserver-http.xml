@@ -125,6 +125,9 @@
     <plugin-factory>
       <engine id="HTTP-TTS" name="httptts" enable="true">
         <max-channel-count>10</max-channel-count>
+        <!-- auto negotiates 8000/16000; use 8000 or 16000 to restrict this engine. -->
+        <param name="sample-rate" value="auto"/>
+        <param name="tts-audio-dir" value="/opt/unimrcp/var/tts"/>
         <param name="url" value="http://127.0.0.1:8889/api/v1/tts"/>
         <!-- Set stream-url (or UNIMRCP_STREAM_TTS_URL) to enable incremental PCM playback. -->
         <!-- <param name="stream-url" value="http://127.0.0.1:8889/api/v1/tts/stream"/> -->
@@ -132,6 +135,7 @@
       </engine>
       <engine id="HTTP-ASR" name="httpasr" enable="true">
         <max-channel-count>10</max-channel-count>
+        <param name="sample-rate" value="auto"/>
         <param name="url" value="http://127.0.0.1:8887/v1/asr/upload"/>
         <!-- Set stream-url (or UNIMRCP_STREAM_ASR_URL) to enable WebSocket PCM input. -->
         <!-- <param name="stream-url" value="ws://127.0.0.1:8887/v1/asr/stream"/> -->
@@ -155,7 +159,8 @@
         <time-skew-detection>1</time-skew-detection>
       </jitter-buffer>
       <ptime>20</ptime>
-      <codecs own-preference="false">L16/99/16000</codecs>
+      <!-- Prefer 8 kHz; retain 16 kHz for clients that only offer wideband. -->
+      <codecs own-preference="true">L16/96/8000 L16/99/16000</codecs>
       <!-- <codecs own-preference="false">PCMU PCMA G722 L16/96/8000 PCMU/97/16000 PCMA/98/16000 L16/99/16000 AMR-WB/102/16000/1/octet-align=1</codecs> -->
       <!-- Enable/disable RTCP support -->
       <rtcp enable="false">

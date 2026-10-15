@@ -25,17 +25,21 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 PREFIX = Path(os.environ.get('UNIMRCP_TEST_PREFIX', '/opt/unimrcp'))
-RATE = 16000
-PCM = struct.pack('<'+'h'*3200, *(int(6000*math.sin(i*2*math.pi*440/RATE)) for i in range(3200)))
+RATE = int(os.environ.get('UNIMRCP_TEST_RATE', '8000'))
+assert RATE in (8000, 16000)
+def pcm_bytes(rate):
+    return struct.pack('<'+'h'*(rate//5), *(int(6000*math.sin(i*2*math.pi*440/rate)) for i in range(rate//5)))
+PCM = pcm_bytes(RATE)
+AUDIO_DIR = None
 ASR_MODE = 'ok'
 ASR_REQUESTS = []
 TTS_REQUESTS = []
 HTTP_ERRORS = []
 
-def wav_bytes():
+def wav_bytes(rate=RATE):
     f = io.BytesIO()
     with wave.open(f, 'wb') as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(PCM)
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm_bytes(rate))
     return f.getvalue()
 
 class Upstream(http.server.BaseHTTPRequestHandler):
@@ -50,11 +54,13 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             if self.path == '/tts':
                 request = json.loads(body)
                 assert set(request) == {'text', 'format', 'sample_rate'}
-                assert request['sample_rate'] == RATE and request['format'] == 'wav'
+                assert request['sample_rate'] in (8000,16000) and request['format'] == 'wav'
                 TTS_REQUESTS.append(request['text'])
                 if request['text'] == 'slow':
                     time.sleep(3)
-                payload = wav_bytes()
+                payload = wav_bytes(request['sample_rate'])
+                if request['text'] == 'wrong-rate':
+                    payload = wav_bytes(16000 if request['sample_rate']==8000 else 8000)
                 if request['text'] == 'bad-wav':
                     payload = payload[:-2]
                 if request['text'] == 'http-error':
@@ -68,10 +74,11 @@ class Upstream(http.server.BaseHTTPRequestHandler):
                     ('Content-Type: '+self.headers['Content-Type']+'\r\nMIME-Version: 1.0\r\n\r\n').encode()+body)
                 fields = {part.get_param('name', header='Content-Disposition'): part.get_payload(decode=True)
                           for part in message.walk() if part.get_content_disposition() == 'form-data'}
-                assert fields['format'] == b'wav' and fields['sample_rate'] == b'16000' and fields['language_hints'] == b'zh'
+                rate=int(fields['sample_rate'])
+                assert fields['format'] == b'wav' and rate in (8000,16000) and fields['language_hints'] == b'zh'
                 with wave.open(io.BytesIO(fields['file']), 'rb') as w:
-                    assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, RATE)
-                    assert w.getnframes() > 2000
+                    assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, rate)
+                    assert w.getnframes() > rate//4
                 mode = ASR_MODE
                 ASR_REQUESTS.append(mode)
                 if mode == 'slow':
@@ -119,8 +126,13 @@ def check_sip_tcp(sip_port):
     print('PASS: SIP OPTIONS over TCP with default transports', flush=True)
 
 class Session:
-    def __init__(self, sip_port, resource):
+    def __init__(self, sip_port, resource, rate=None, offered_rates=None):
         self.sip_port, self.resource = sip_port, resource
+        self.rate = RATE if rate is None else rate
+        offered_rates = offered_rates or (self.rate,)
+        payloads = {8000:96,16000:99}
+        codecs = ' '.join(str(payloads[rate]) for rate in offered_rates)
+        mappings = ''.join(f'a=rtpmap:{payloads[rate]} L16/{rate}/1\r\n' for rate in offered_rates)
         self.rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp.bind(('127.0.0.1', 0)); self.rtp.settimeout(2)
         self.sip = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -132,8 +144,8 @@ class Session:
         direction = 'recvonly' if resource == 'speechsynth' else 'sendonly'
         sdp = ('v=0\r\no=test 1 1 IN IP4 127.0.0.1\r\ns=test\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n'
                'm=application 9 TCP/MRCPv2 1\r\na=setup:active\r\na=connection:new\r\n'
-               f'a=resource:{resource}\r\na=cmid:1\r\nm=audio {self.rtp.getsockname()[1]} RTP/AVP 99\r\n'
-               f'a=rtpmap:99 L16/16000/1\r\na={direction}\r\na=mid:1\r\n')
+               f'a=resource:{resource}\r\na=cmid:1\r\nm=audio {self.rtp.getsockname()[1]} RTP/AVP {codecs}\r\n'
+               f'{mappings}a={direction}\r\na=mid:1\r\n')
         invite = self.send_sip('INVITE', 1, sdp)
         # SIP is UDP here: retransmit the same transaction if the first packet
         # arrives before Sofia's receive task is ready (or is otherwise lost).
@@ -154,6 +166,8 @@ class Session:
         self.to = re.search(r'^To:\s*(.+)\r?$', response, re.M|re.I)[1].strip()
         mrcp_port = int(re.search(r'm=application (\d+)', response)[1])
         self.server_rtp = int(re.search(r'm=audio (\d+)', response)[1])
+        self.payload_type = int(re.search(r'm=audio \d+ RTP/AVP (\d+)', response)[1])
+        self.rate = int(re.search(rf'a=rtpmap:{self.payload_type} L16/(\d+)', response)[1])
         self.channel = re.search(r'a=channel:([^\r\n]+)', response)[1]
         self.send_sip('ACK', 1)
         self.control = socket.create_connection(('127.0.0.1', mrcp_port), timeout=5)
@@ -213,10 +227,11 @@ class Session:
     def audio(self, speech=True):
         # 0.4s voiced + 0.4s silence. Actual RTP timing, not a fast packet dump.
         start = time.monotonic()
-        timestamp = int((start-self.rtp_origin)*RATE)
+        timestamp = int((start-self.rtp_origin)*self.rate)
+        samples = self.rate//50
         for seq in range(40):
-            pcm = [int(6000*math.sin((seq*320+i)*2*math.pi*440/RATE)) if speech and seq < 20 else 0 for i in range(320)]
-            packet = struct.pack('!BBHII', 0x80, 99, self.rtp_sequence & 0xffff, (timestamp+seq*320) & 0xffffffff, 12345)+struct.pack('!320h', *pcm)
+            pcm = [int(6000*math.sin((seq*samples+i)*2*math.pi*440/self.rate)) if speech and seq < 20 else 0 for i in range(samples)]
+            packet = struct.pack('!BBHII', 0x80, self.payload_type, self.rtp_sequence & 0xffff, (timestamp+seq*samples) & 0xffffffff, 12345)+struct.pack(f'!{samples}h', *pcm)
             self.rtp_sequence += 1
             self.rtp.sendto(packet, ('127.0.0.1', self.server_rtp))
             time.sleep(max(0, start+(seq+1)*.02-time.monotonic()))
@@ -246,10 +261,33 @@ class Session:
     def __exit__(self, *_):
         self.close()
 
+def record_files():
+    return set(AUDIO_DIR.glob('*.wav'))
+
+def assert_new_recording(before, pcm, rate=RATE):
+    new = record_files()-before
+    assert len(new)==1, new
+    path = new.pop()
+    assert re.fullmatch(r'[0-9a-f-]{36}\.wav',path.name), path
+    with wave.open(str(path), 'rb') as wav:
+        assert (wav.getnchannels(),wav.getsampwidth(),wav.getframerate())==(1,2,rate)
+        assert wav.readframes(wav.getnframes())==pcm, 'Recorded PCM differs from generated PCM'
+
+def check_record_failure(sip):
+    # Force an open failure without relying on permissions (tests run as root).
+    displaced = AUDIO_DIR.with_name('recordings-displaced')
+    AUDIO_DIR.rename(displaced)
+    try:
+        with Session(sip,'speechsynth') as s:
+            s.speak('cannot-save'); s.event('SPEAK-COMPLETE',4)
+    finally:
+        displaced.rename(AUDIO_DIR)
+
 def exercise(sip):
     global ASR_MODE
     with Session(sip, 'speechsynth') as s:
         for phrase in ('你好', 'placeholder'):
+            before=record_files()
             s.speak(phrase)
             heard = bytearray()
             deadline = time.monotonic()+3
@@ -261,8 +299,11 @@ def exercise(sip):
                     break
             assert any(heard), 'TTS emitted only silence'
             s.event('SPEAK-COMPLETE', 0)
-        for phrase in ('bad-wav', 'http-error'):
+            assert_new_recording(before,PCM)
+        before=record_files()
+        for phrase in ('bad-wav', 'http-error', 'wrong-rate'):
             s.speak(phrase); s.event('SPEAK-COMPLETE', 4)
+        assert record_files()==before, 'Failed synthesis published a WAV'
         s.speak('slow'); time.sleep(.1)
         start = time.monotonic(); s.send('STOP'); s.response()
         assert time.monotonic()-start < 2, 'STOP blocked behind upstream HTTP'
@@ -292,15 +333,37 @@ def exercise(sip):
         s.speak('still-alive'); s.event('SPEAK-COMPLETE',0)
     assert not HTTP_ERRORS, HTTP_ERRORS
     print('PASS: concurrent sessions, close during HTTP, fresh session after delayed response', flush=True)
+    with Session(sip,'speechsynth',offered_rates=(16000,8000)) as s:
+        assert s.rate==8000, 'Server did not prefer 8 kHz'
+    with Session(sip,'speechsynth',rate=8000) as low, Session(sip,'speechsynth',rate=16000) as high:
+        before=record_files(); low.speak('8k'); low.event('SPEAK-COMPLETE',0)
+        assert_new_recording(before,pcm_bytes(8000),8000)
+        before=record_files(); high.speak('16k'); high.event('SPEAK-COMPLETE',0)
+        assert_new_recording(before,pcm_bytes(16000),16000)
+    ASR_MODE='ok'
+    with Session(sip,'speechrecog',rate=8000) as low, Session(sip,'speechrecog',rate=16000) as high:
+        for s in (low,high):
+            s.recognize(); s.audio(); s.event('RECOGNITION-COMPLETE',0)
+    check_record_failure(sip)
+    with Session(sip,'speechsynth') as s:
+        before=record_files(); s.speak('after-disk-error'); s.event('SPEAK-COMPLETE',0)
+        assert_new_recording(before,PCM)
+    print('PASS: 8 kHz preference, concurrent 8/16 kHz, exact TTS WAV archive, mismatch rejection and save failure/recovery',flush=True)
 
-def run_server(tts_url, asr_url, exercise, streaming=False):
+def run_server(tts_url, asr_url, exercise, streaming=False, sample_rate='auto', save_audio=True):
+    global AUDIO_DIR
     tmp=Path(tempfile.mkdtemp(prefix='unimrcp-http-test-'))
     shutil.copytree(PREFIX/'conf',tmp/'conf')
     (tmp/'plugin').symlink_to(PREFIX/'plugin')
     for name in ('data','log','var'):
         (tmp/name).mkdir()
     sip, mrcp = free_port(), free_port()
+    AUDIO_DIR=tmp/'recordings'
     tree=ET.parse(ROOT/'conf/unimrcpserver-http.xml')
+    for param in tree.findall('.//engine/param[@name="sample-rate"]'):
+        param.set('value',str(sample_rate))
+    if not save_audio:
+        tree.find('.//engine/param[@name="tts-audio-dir"]').set('value','')
     tree.find('.//sip-port').text=str(sip); tree.find('.//mrcp-port').text=str(mrcp)
     if streaming:
         for param in tree.findall('.//engine/param[@name="http-timeout-ms"]'):
@@ -308,6 +371,7 @@ def run_server(tts_url, asr_url, exercise, streaming=False):
     tree.write(tmp/'conf/unimrcpserver.xml',encoding='utf-8',xml_declaration=True)
     env=dict(os.environ,UNIMRCP_HTTP_TTS_URL=tts_url,UNIMRCP_HTTP_ASR_URL=asr_url,
              UNIMRCP_STREAM_TTS_URL=tts_url if streaming else '',UNIMRCP_STREAM_ASR_URL=asr_url if streaming else '')
+    env['UNIMRCP_TTS_AUDIO_DIR']=str(AUDIO_DIR) if save_audio else ''
     # Requests must go directly to the configured voice gateways.
     env.update(http_proxy='http://127.0.0.1:9', https_proxy='http://127.0.0.1:9', no_proxy='')
     logfile=tmp/'server-console.log'
@@ -338,7 +402,8 @@ def run_server(tts_url, asr_url, exercise, streaming=False):
                 except subprocess.TimeoutExpired:
                     process.kill(); process.wait()
     assert process.returncode==0, f'Non-clean shutdown: {process.returncode}'
-    print('PASS: clean server shutdown',flush=True)
+    assert not list(AUDIO_DIR.glob('*.part')), 'Temporary TTS files survived cancel/error/shutdown'
+    print(f'PASS: {RATE} Hz, clean server shutdown and recording cleanup',flush=True)
 
 def main():
     cflags=subprocess.check_output(['pkg-config','--cflags','libcurl','json-c','libwebsockets'],text=True).split()

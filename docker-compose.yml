@@ -2,7 +2,7 @@ name: unimrcp-http
 
 services:
   unimrcp:
-    image: "${UNIMRCP_IMAGE:-local/unimrcp-http:1.8.0}"
+    image: "unimrcp-http:20261012-8k16k"
     platform: linux/amd64
     # Use the image already imported with docker load.
     pull_policy: never
@@ -11,11 +11,14 @@ services:
     network_mode: host
     stop_grace_period: 30s
     environment:
-      UNIMRCP_HTTP_ASR_URL: "${UNIMRCP_HTTP_ASR_URL:-http://127.0.0.1:8887/v1/asr/upload}"
-      UNIMRCP_HTTP_TTS_URL: "${UNIMRCP_HTTP_TTS_URL:-http://127.0.0.1:8889/api/v1/tts}"
-      UNIMRCP_STREAM_ASR_URL: "${UNIMRCP_STREAM_ASR_URL:-}"
-      UNIMRCP_STREAM_TTS_URL: "${UNIMRCP_STREAM_TTS_URL:-}"
+      UNIMRCP_HTTP_ASR_URL: "http://127.0.0.1:5004/v1/asr/upload"
+      UNIMRCP_HTTP_TTS_URL: "http://127.0.0.1:5005/api/v1/tts"
+      UNIMRCP_STREAM_ASR_URL: ""
+      UNIMRCP_STREAM_TTS_URL: ""
     volumes:
+      - type: bind
+        source: ./tts-audio
+        target: /opt/unimrcp/var/tts
       - type: bind
         source: ./conf/unimrcpserver-http.xml
         target: /opt/unimrcp/conf/unimrcpserver.xml

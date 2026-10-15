@@ -10,6 +10,13 @@ INSTALLATION
 
 See the file "INSTALL" for installation tips.
 
+HTTP ASR / TTS Docker deployment:
+  deploy/INSTALL.txt contains the deployment instructions.
+  deploy/http/ and deploy/stream/ contain the non-streaming and streaming configs.
+  Set the image and backend URLs directly in each docker-compose.yml.
+  deploy/check_running_server.py checks a running server through SIP/MRCP/RTP.
+  dist/ contains only exported Docker images and their checksum files.
+
 
 DOCUMENTATION
 =============

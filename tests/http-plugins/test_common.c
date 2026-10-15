@@ -9,20 +9,25 @@
 int main(void)
 {
     int16_t samples[]={-32768,-123,0,123,32767}; hp_buffer wav={0},pcm={0}; char *xml;
-    assert(hp_wav_encode((unsigned char *)samples,sizeof(samples),&wav));
-    assert(hp_wav_decode(wav.data,wav.len,&pcm));
+    int rates[]={8000,16000}; size_t rate_index;
+    for (rate_index=0;rate_index<2;++rate_index) {
+    int rate=rates[rate_index];
+    assert(hp_wav_encode((unsigned char *)samples,sizeof(samples),rate,&wav));
+    assert(hp_wav_decode(wav.data,wav.len,rate,&pcm));
     assert(pcm.len==sizeof(samples) && !memcmp(pcm.data,samples,sizeof(samples)));
     hp_buffer_free(&pcm);
-    assert(!hp_wav_decode(wav.data,wav.len-1,&pcm));
-    wav.data[24]=0x40; wav.data[25]=0x1f; /* 8000 Hz must not play at the wrong speed. */
-    assert(!hp_wav_decode(wav.data,wav.len,&pcm));
-    wav.data[24]=0x80; wav.data[25]=0x3e;
+    assert(!hp_wav_decode(wav.data,wav.len-1,rate,&pcm));
+    assert(!hp_wav_decode(wav.data,wav.len,rate==8000 ? 16000 : 8000,&pcm));
+    assert(!hp_wav_decode(wav.data,wav.len,24000,&pcm));
     wav.data[4]=0xbf; wav.data[5]=0xff; wav.data[6]=0xff; wav.data[7]=0x7f;
     wav.data[40]=0x9b; wav.data[41]=0xff; wav.data[42]=0xff; wav.data[43]=0x7f;
-    assert(hp_wav_decode(wav.data,wav.len,&pcm)); hp_buffer_free(&pcm);
+    assert(hp_wav_decode(wav.data,wav.len,rate,&pcm)); hp_buffer_free(&pcm);
     wav.data[40]=0x9a;
-    assert(!hp_wav_decode(wav.data,wav.len,&pcm)); hp_buffer_free(&wav);
-    assert(!hp_wav_encode((unsigned char *)samples,3,&wav));
+    assert(!hp_wav_decode(wav.data,wav.len,rate,&pcm)); hp_buffer_free(&wav);
+    assert(!hp_wav_encode((unsigned char *)samples,3,rate,&wav));
+    }
+    assert(!hp_wav_encode((unsigned char *)samples,sizeof(samples),24000,&wav));
+    { unsigned char header[44]; assert(hp_wav_header(header,0,8000)); assert(!hp_wav_header(header,1,8000)); }
     xml=hp_nlsml("\xe4\xbd\xa0\xe5\xa5\xbd<&\"'",10);
     assert(xml && strstr(xml,"&lt;&amp;&quot;&apos;")); free(xml);
     assert(!hp_nlsml("bad\x01",4));

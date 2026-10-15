@@ -1,19 +1,18 @@
-name: unimrcp-stream
-
 services:
-  unimrcp:
-    # This is the tag stored in unimrcp-http-20261008.tar.
-    image: "${UNIMRCP_IMAGE:-unimrcp-http:20061008}"
+  unimrcp-stream:
+    image: "unimrcp-http:20261012-8k16k"
     container_name: unimrcp-stream
     platform: linux/amd64
     pull_policy: never
     restart: unless-stopped
     network_mode: host
     stop_grace_period: 30s
+
     environment:
-      # Require both URLs so this instance always enables streaming.
-      UNIMRCP_STREAM_ASR_URL: "${UNIMRCP_STREAM_ASR_URL:?Set UNIMRCP_STREAM_ASR_URL in .env}"
-      UNIMRCP_STREAM_TTS_URL: "${UNIMRCP_STREAM_TTS_URL:?Set UNIMRCP_STREAM_TTS_URL in .env}"
+      TZ: Asia/Shanghai
+      UNIMRCP_STREAM_ASR_URL: "ws://127.0.0.1:5004/v1/asr/stream"
+      UNIMRCP_STREAM_TTS_URL: "http://127.0.0.1:5005/api/v1/tts/stream"
+
     volumes:
       - type: bind
         source: ./conf/unimrcpserver-http.xml
@@ -21,7 +20,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
-    # The image defaults to running tests; start the server instead.
+      - type: bind
+        source: ./tts-audio
+        target: /opt/unimrcp/var/tts
+
     command:
       - stdbuf
       - -oL
@@ -32,6 +34,7 @@ services:
       - -w
       - -o
       - "1"
+
     logging:
       driver: json-file
       options:

@@ -20,4 +20,4 @@ RUN python3 tests/http-plugins/normalize_source.py && chmod +x bootstrap build/*
     --enable-http-tts-plugin --enable-http-asr-plugin --disable-umc \
     && make -j2 && make install
 ENV LD_LIBRARY_PATH=/opt/unimrcp/lib:/opt/unimrcp-deps/lib
-CMD ["python3", "tests/http-plugins/test_integration.py"]
+CMD ["python3", "tests/http-plugins/run_matrix.py"]

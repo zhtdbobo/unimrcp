@@ -12,8 +12,8 @@ typedef size_t (*hp_pcm_source)(void *, unsigned char *, size_t, int *eof);
 typedef struct hp_stream hp_stream;
 
 hp_stream *hp_stream_tts(const char *url, const char *text, size_t len,
-                         const char *id, long timeout, hp_pcm_sink sink, void *context);
-hp_stream *hp_stream_asr(const char *url, const char *id, long timeout,
+                         const char *id, int rate, long timeout, hp_pcm_sink sink, void *context);
+hp_stream *hp_stream_asr(const char *url, const char *id, int rate, long timeout,
                          long silence_ms, hp_pcm_source source, void *context);
 /* 0: running, 1: successfully finished, -1: failed. Never waits for audio. */
 int hp_stream_poll(hp_stream *stream);

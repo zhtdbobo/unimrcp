@@ -125,6 +125,8 @@
     <plugin-factory>
       <engine id="HTTP-TTS" name="httptts" enable="true">
         <max-channel-count>10</max-channel-count>
+        <param name="sample-rate" value="auto"/>
+        <param name="tts-audio-dir" value="/opt/unimrcp/var/tts"/>
         <param name="url" value="http://127.0.0.1:5005/api/v1/tts"/>
         <!-- Compose requires UNIMRCP_STREAM_TTS_URL from .env to enable streaming. -->
         <!-- <param name="stream-url" value="http://127.0.0.1:5005/api/v1/tts/stream"/> -->
@@ -132,13 +134,14 @@
       </engine>
       <engine id="HTTP-ASR" name="httpasr" enable="true">
         <max-channel-count>10</max-channel-count>
+        <param name="sample-rate" value="auto"/>
         <param name="url" value="http://127.0.0.1:5004/v1/asr/upload"/>
         <!-- Compose requires UNIMRCP_STREAM_ASR_URL from .env to enable streaming. -->
         <!-- <param name="stream-url" value="ws://127.0.0.1:5004/v1/asr/stream"/> -->
         <param name="http-timeout-ms" value="90000"/>
         <param name="max-utterance-ms" value="60000"/>
         <param name="no-input-timeout-ms" value="15000"/>
-        <param name="speech-complete-timeout-ms" value="1000"/>
+        <param name="speech-complete-timeout-ms" value="500"/>
         <param name="min-speech-ms" value="120"/>
         <param name="vad-threshold" value="500"/>
       </engine>
@@ -155,7 +158,7 @@
         <time-skew-detection>1</time-skew-detection>
       </jitter-buffer>
       <ptime>20</ptime>
-      <codecs own-preference="false">L16/99/16000</codecs>
+      <codecs own-preference="true">L16/96/8000 L16/99/16000</codecs>
       <!-- <codecs own-preference="false">PCMU PCMA G722 L16/96/8000 PCMU/97/16000 PCMA/98/16000 L16/99/16000 AMR-WB/102/16000/1/octet-align=1</codecs> -->
       <!-- Enable/disable RTCP support -->
       <rtcp enable="false">

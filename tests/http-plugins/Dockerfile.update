@@ -1,0 +1,19 @@
+# Offline incremental rebuild using the existing development/test image.
+# The base must contain the configured /src tree and libwebsockets dependencies.
+ARG BASE_IMAGE=unimrcp-http:20061008
+FROM ${BASE_IMAGE}
+WORKDIR /src
+COPY plugins/http-common/ plugins/http-common/
+COPY plugins/http-asr/src/ plugins/http-asr/src/
+COPY plugins/http-tts/src/ plugins/http-tts/src/
+COPY tests/http-plugins/ tests/http-plugins/
+COPY conf/unimrcpserver-http.xml conf/unimrcpserver-http.xml
+RUN python3 tests/http-plugins/normalize_source.py \
+    && make -C plugins/http-tts clean \
+    && make -C plugins/http-asr clean \
+    && make -C plugins/http-tts -j2 CFLAGS="-g -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers" \
+    && make -C plugins/http-asr -j2 CFLAGS="-g -O2 -Wall -Wextra -Werror -Wno-missing-field-initializers" \
+    && make -C plugins/http-tts install \
+    && make -C plugins/http-asr install \
+    && cp conf/unimrcpserver-http.xml /opt/unimrcp/conf/unimrcpserver.xml
+CMD ["python3", "tests/http-plugins/run_matrix.py"]

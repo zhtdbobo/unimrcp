@@ -9,7 +9,8 @@ import time
 
 import websockets
 
-from test_integration import PCM, RATE, Session, run_server
+from test_integration import PCM, RATE, Session, run_server, record_files, assert_new_recording, check_record_failure
+import test_integration
 
 ERRORS = []
 RELEASE = threading.Event()
@@ -94,7 +95,7 @@ async def asr_handler(ws, path):
             packet = await ws.recv()
             if isinstance(packet, str):
                 assert json.loads(packet) == {'type': 'finish'}
-                assert len(audio) > 2000
+                assert len(audio) > RATE//4*2
                 ASR_FINISHED.append(mode)
                 if mode == 'no-completion':
                     await ws.wait_closed(); return
@@ -146,14 +147,20 @@ def wait_audio(session):
 def exercise(sip):
     global ASR_MODE
     with Session(sip, 'speechsynth') as s:
+        before=record_files()
         RELEASE.clear()
         s.speak('gated'); wait_audio(s)
         no_event(s, .3)  # First block drains; the HTTP stream remains open.
         s.send('PAUSE'); s.response()
         s.send('RESUME'); s.response()
+        partial=list(test_integration.AUDIO_DIR.glob('*.part'))
+        assert len(partial)==1 and partial[0].stat().st_size>44, 'Streaming audio was not saved incrementally'
         RELEASE.set(); s.event('SPEAK-COMPLETE', 0)
+        assert_new_recording(before,PCM*2)
+        before=record_files()
         for phrase in ('odd', 'empty', 'wrong-type', 'http-error', 'redirect', 'truncated'):
             s.speak(phrase); s.event('SPEAK-COMPLETE', 4)
+        assert record_files()==before, 'Invalid streaming synthesis published a WAV'
         for phrase in ('slow', 'burst'):
             s.speak(phrase)
             s.send('PAUSE'); s.response()
@@ -222,6 +229,10 @@ def exercise(sip):
     with Session(sip, 'speechrecog') as s:
         s.recognize(); s.audio(); s.event('RECOGNITION-COMPLETE', 0)
     assert not ERRORS, ERRORS
+    check_record_failure(sip)
+    with Session(sip,'speechsynth') as s:
+        before=record_files(); s.speak('after-disk-error'); s.event('SPEAK-COMPLETE',0)
+        assert_new_recording(before,PCM)
     print('PASS: parallel streaming sessions and close during HTTP / WebSocket startup', flush=True)
 
 

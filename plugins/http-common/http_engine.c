@@ -13,6 +13,7 @@
 #include <apr_thread_mutex.h>
 #include <apr_uuid.h>
 #include <apr_strings.h>
+#include <apr_file_io.h>
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,10 @@
 
 typedef struct {
     const char *url;
+    int sample_rate; /* 0: negotiate either supported rate. */
+#ifdef HP_SYNTH
+    const char *audio_dir;
+#endif
     long timeout_ms, max_ms, noinput_ms, silence_ms, activity_ms, threshold;
     int curl_ready, streaming;
 } http_engine;
@@ -53,6 +58,13 @@ typedef struct {
     hp_ring ring;
     hp_stream *transfer; /* Worker-owned; closed before freeing the ring. */
     int stream_done;
+    int sample_rate;
+#ifdef HP_SYNTH
+    apr_pool_t *record_pool;
+    apr_file_t *record_file;
+    const char *record_temp, *record_final;
+    size_t record_bytes;
+#endif
     int paused, input_timers, speech_reported;
     long noinput_ms, silence_ms, max_ms, recognition_ms;
     size_t run_samples, quiet_samples, total_samples;
@@ -104,6 +116,10 @@ static apt_bool_t engine_open(mrcp_engine_t *engine)
     e->streaming=stream_url && *stream_url;
     if (e->streaming) url=stream_url;
     e->url=url ? apr_pstrdup(engine->pool,url) : NULL;
+    {
+        const char *rate=mrcp_engine_param_get(engine,"sample-rate");
+        e->sample_rate=(!rate || !strcmp(rate,"auto")) ? 0 : (int)config_number(engine,"sample-rate",0,8000,16000);
+    }
     e->timeout_ms=config_number(engine,"http-timeout-ms",60000,1000,180000);
     e->max_ms=config_number(engine,"max-utterance-ms",60000,1000,120000);
     e->noinput_ms=config_number(engine,"no-input-timeout-ms",15000,100,120000);
@@ -114,8 +130,21 @@ static apt_bool_t engine_open(mrcp_engine_t *engine)
 #ifndef HP_SYNTH
     if (e->streaming) valid_url=e->url && (!strncmp(e->url,"ws://",5) || !strncmp(e->url,"wss://",6));
 #endif
-    valid=valid_url &&
+    valid=valid_url && (e->sample_rate==0 || hp_rate_valid(e->sample_rate)) &&
           e->timeout_ms>0 && e->max_ms>0 && e->noinput_ms>0 && e->silence_ms>0 && e->activity_ms>0 && e->threshold>0;
+#ifdef HP_SYNTH
+    {
+        const char *dir=getenv("UNIMRCP_TTS_AUDIO_DIR");
+        if (!dir || !*dir) dir=mrcp_engine_param_get(engine,"tts-audio-dir");
+        if (dir && *dir) {
+            char *absolute=NULL; apr_finfo_t info;
+            if (apr_filepath_merge(&absolute,NULL,dir,APR_FILEPATH_NOTRELATIVE,engine->pool)!=APR_SUCCESS ||
+                (apr_dir_make_recursive(absolute,APR_UREAD|APR_UWRITE|APR_UEXECUTE,engine->pool)!=APR_SUCCESS &&
+                 (apr_stat(&info,absolute,APR_FINFO_TYPE,engine->pool)!=APR_SUCCESS || info.filetype!=APR_DIR))) valid=0;
+            else e->audio_dir=absolute;
+        }
+    }
+#endif
     if (valid) e->curl_ready=curl_global_init(CURL_GLOBAL_DEFAULT)==CURLE_OK;
     if (!valid || !e->curl_ready) apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"HTTP speech plugin: invalid configuration or CURL initialization failed");
     return mrcp_engine_open_respond(engine,valid && e->curl_ready);
@@ -132,9 +161,70 @@ static int cancelled(void *context)
     http_channel *c=context;
     return apr_atomic_read32(&c->closing) || apr_atomic_read32(&c->epoch)!=apr_atomic_read32(&c->active_epoch);
 }
+#ifdef HP_SYNTH
+/* Recording belongs to the worker; RTP callbacks never perform disk I/O.
+ * Publish only a complete synthesis. STOP/error/close removes its temporary file.
+ */
+static void record_abort(http_channel *c)
+{
+    if (c->record_file) { apr_file_close(c->record_file); c->record_file=NULL; }
+    if (c->record_temp) apr_file_remove(c->record_temp,c->record_pool);
+    if (c->record_pool) apr_pool_destroy(c->record_pool);
+    c->record_pool=NULL; c->record_temp=c->record_final=NULL; c->record_bytes=0;
+}
+static int record_start(http_channel *c)
+{
+    unsigned char header[44];
+    if (!c->engine->audio_dir) return 1;
+    if (apr_pool_create(&c->record_pool,c->base->pool)!=APR_SUCCESS) return 0;
+    c->record_final=apr_pstrcat(c->record_pool,c->engine->audio_dir,"/",c->request_id,".wav",NULL);
+    c->record_temp=apr_pstrcat(c->record_pool,c->record_final,".part",NULL);
+    if (!hp_wav_header(header,0,c->sample_rate)) return 0;
+    if (apr_file_open(&c->record_file,c->record_temp,APR_CREATE|APR_EXCL|APR_WRITE|APR_BINARY,
+                      APR_UREAD|APR_UWRITE,c->record_pool)!=APR_SUCCESS) {
+        c->record_temp=NULL; return 0; /* Do not unlink a file we did not create. */
+    }
+    if (apr_file_write_full(c->record_file,header,sizeof(header),NULL)!=APR_SUCCESS) return 0;
+    return 1;
+}
+static int record_write(http_channel *c, const unsigned char *pcm, size_t len)
+{
+    const uint16_t one=1;
+    if (!c->record_file) return 1;
+    if (len%2 || len>HP_MAX_AUDIO-44-c->record_bytes) return 0;
+    if (*(const unsigned char *)&one) {
+        if (apr_file_write_full(c->record_file,pcm,len,NULL)!=APR_SUCCESS) return 0;
+    } else {
+        unsigned char little[4096]; size_t offset=0,i,n;
+        while (offset<len) {
+            n=len-offset; if (n>sizeof(little)) n=sizeof(little);
+            for (i=0;i<n;i+=2) { little[i]=pcm[offset+i+1]; little[i+1]=pcm[offset+i]; }
+            if (apr_file_write_full(c->record_file,little,n,NULL)!=APR_SUCCESS) return 0;
+            offset+=n;
+        }
+    }
+    c->record_bytes+=len; return 1;
+}
+static int record_finish(http_channel *c)
+{
+    unsigned char header[44]; apr_off_t offset=0; apr_status_t status;
+    if (!c->record_file) return 1;
+    if (!c->record_bytes || !hp_wav_header(header,c->record_bytes,c->sample_rate) ||
+        apr_file_seek(c->record_file,APR_SET,&offset)!=APR_SUCCESS ||
+        apr_file_write_full(c->record_file,header,sizeof(header),NULL)!=APR_SUCCESS ||
+        apr_file_sync(c->record_file)!=APR_SUCCESS) return 0;
+    status=apr_file_close(c->record_file); c->record_file=NULL;
+    if (status!=APR_SUCCESS || apr_file_rename(c->record_temp,c->record_final,c->record_pool)!=APR_SUCCESS) return 0;
+    apt_log(APT_LOG_MARK,APT_PRIO_INFO,"TTS audio saved request=%s rate=%d bytes=%lu",c->request_id,c->sample_rate,(unsigned long)c->record_bytes);
+    c->record_temp=NULL; record_abort(c); return 1;
+}
+#endif
 static void clear_audio(http_channel *c)
 {
     hp_stream_close(c->transfer); c->transfer=NULL;
+#ifdef HP_SYNTH
+    record_abort(c);
+#endif
     apr_thread_mutex_lock(c->media_mutex);
     apr_atomic_set32(&c->media_state,HP_IDLE);
     hp_buffer_free(&c->audio); c->position=0; c->paused=0;
@@ -149,6 +239,10 @@ static int streaming_audio(void *context, const unsigned char *pcm, size_t len)
     apr_thread_mutex_lock(c->media_mutex);
     ok=hp_ring_write(&c->ring,pcm,len);
     apr_thread_mutex_unlock(c->media_mutex);
+    if (ok && !record_write(c,pcm,len)) {
+        apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"TTS audio save failed request=%s",c->request_id);
+        return -1;
+    }
     return ok;
 }
 #else
@@ -222,7 +316,8 @@ static void start_request(http_channel *c, http_command *command)
     codec=mrcp_engine_sink_stream_codec_get(c->base);
 #endif
     if (c->active) { reply(c,r,MRCP_STATUS_CODE_METHOD_NOT_VALID,MRCP_REQUEST_STATE_COMPLETE); return; }
-    if (!codec || codec->sampling_rate!=HP_RATE || codec->channel_count!=1 || !plain_content(r)) {
+    if (!codec || !hp_rate_valid(codec->sampling_rate) ||
+        (c->engine->sample_rate && codec->sampling_rate!=c->engine->sample_rate) || codec->channel_count!=1 || !plain_content(r)) {
         reply(c,r,MRCP_STATUS_CODE_UNSUPPORTED_PARAM_VALUE,MRCP_REQUEST_STATE_COMPLETE); return;
     }
 #ifdef HP_SYNTH
@@ -244,7 +339,7 @@ static void start_request(http_channel *c, http_command *command)
     if (c->noinput_ms<100 || c->noinput_ms>120000 || c->silence_ms<100 || c->silence_ms>10000 || c->recognition_ms<0 || c->recognition_ms>120000) {
         reply(c,r,MRCP_STATUS_CODE_ILLEGAL_PARAM_VALUE,MRCP_REQUEST_STATE_COMPLETE); return;
     }
-    pcm=c->engine->streaming ? NULL : malloc((size_t)c->max_ms*HP_RATE*2/1000);
+    pcm=c->engine->streaming ? NULL : malloc((size_t)c->max_ms*codec->sampling_rate*2/1000);
     if (!pcm && !c->engine->streaming) { reply(c,r,MRCP_STATUS_CODE_METHOD_FAILED,MRCP_REQUEST_STATE_COMPLETE); return; }
 #endif
     if (c->engine->streaming) {
@@ -252,6 +347,7 @@ static void start_request(http_channel *c, http_command *command)
         if (!ring) { reply(c,r,MRCP_STATUS_CODE_METHOD_FAILED,MRCP_REQUEST_STATE_COMPLETE); return; }
     }
     clear_audio(c); apr_atomic_set32(&c->active_epoch,command->epoch); c->active=r;
+    c->sample_rate=codec->sampling_rate;
     c->ring.data=ring; c->ring.cap=ring ? HP_RING_CAP : 0;
     c->started=c->timers_started=apr_time_now(); c->speech_reported=0;
     apr_atomic_set32(&c->speech,0); apr_atomic_set32(&c->media_fault,0);
@@ -259,30 +355,39 @@ static void start_request(http_channel *c, http_command *command)
     reply(c,r,MRCP_STATUS_CODE_SUCCESS,MRCP_REQUEST_STATE_INPROGRESS);
 #ifdef HP_SYNTH
     if (cancelled(c)) return;
+    if (!record_start(c)) {
+        apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"TTS audio save failed request=%s",c->request_id);
+        complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0); return;
+    }
     if (c->engine->streaming) {
         apr_atomic_set32(&c->media_state,HP_PLAYING);
-        c->transfer=hp_stream_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->engine->timeout_ms,streaming_audio,c);
+        c->transfer=hp_stream_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->sample_rate,c->engine->timeout_ms,streaming_audio,c);
         if (!c->transfer) complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0);
         return;
     }
-    if (!hp_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->engine->timeout_ms,cancelled,c,&pcm)) {
+    if (!hp_tts(c->engine->url,r->body.buf,r->body.length,c->request_id,c->sample_rate,c->engine->timeout_ms,cancelled,c,&pcm)) {
         if (!cancelled(c)) {
             apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"HTTP TTS failed request=%s",c->request_id);
             complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0);
         }
         return;
     }
+    if (!cancelled(c) && (!record_write(c,pcm.data,pcm.len) || !record_finish(c))) {
+        hp_buffer_free(&pcm);
+        apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"TTS audio save failed request=%s",c->request_id);
+        complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0); return;
+    }
     apr_thread_mutex_lock(c->media_mutex);
     if (!cancelled(c)) { c->audio=pcm; memset(&pcm,0,sizeof(pcm)); apr_atomic_set32(&c->media_state,HP_PLAYING); }
     apr_thread_mutex_unlock(c->media_mutex); hp_buffer_free(&pcm);
 #else
     apr_thread_mutex_lock(c->media_mutex);
-    c->audio.data=pcm; c->audio.cap=c->audio.limit=(size_t)c->max_ms*HP_RATE*2/1000;
+    c->audio.data=pcm; c->audio.cap=c->audio.limit=(size_t)c->max_ms*c->sample_rate*2/1000;
     c->run_samples=c->quiet_samples=c->total_samples=0;
     if (!cancelled(c)) apr_atomic_set32(&c->media_state,HP_CAPTURING);
     apr_thread_mutex_unlock(c->media_mutex);
     if (c->engine->streaming && !cancelled(c)) {
-        c->transfer=hp_stream_asr(c->engine->url,c->request_id,c->engine->timeout_ms,c->silence_ms,streaming_audio,c);
+        c->transfer=hp_stream_asr(c->engine->url,c->request_id,c->sample_rate,c->engine->timeout_ms,c->silence_ms,streaming_audio,c);
         if (!c->transfer) complete(c,RECOGNIZER_COMPLETION_CAUSE_ERROR,NULL,0);
     }
 #endif
@@ -333,6 +438,10 @@ static void poll_media(http_channel *c)
             complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0); return;
         }
         if (status>0) {
+            if (!record_finish(c)) {
+                apt_log(APT_LOG_MARK,APT_PRIO_WARNING,"TTS audio save failed request=%s",c->request_id);
+                complete(c,SYNTHESIZER_COMPLETION_CAUSE_ERROR,NULL,0); return;
+            }
             hp_stream_close(c->transfer); c->transfer=NULL;
             apr_thread_mutex_lock(c->media_mutex); c->stream_done=1; apr_thread_mutex_unlock(c->media_mutex);
         }
@@ -368,7 +477,7 @@ static void poll_media(http_channel *c)
     if (state==HP_RECOG_READY && !c->engine->streaming) {
         hp_buffer pcm; char *text=NULL; size_t len=0; int ok;
         apr_thread_mutex_lock(c->media_mutex); pcm=c->audio; memset(&c->audio,0,sizeof(c->audio)); apr_atomic_set32(&c->media_state,HP_IDLE); apr_thread_mutex_unlock(c->media_mutex);
-        ok=hp_asr(c->engine->url,pcm.data,pcm.len,c->request_id,c->engine->timeout_ms,cancelled,c,&text,&len);
+        ok=hp_asr(c->engine->url,pcm.data,pcm.len,c->request_id,c->sample_rate,c->engine->timeout_ms,cancelled,c,&text,&len);
         hp_buffer_free(&pcm);
         if (!cancelled(c)) {
             size_t i; int nonspace=0;
@@ -411,7 +520,8 @@ static mrcp_engine_channel_t *channel_create(mrcp_engine_t *engine, apr_pool_t *
 #else
     caps=mpf_sink_stream_capabilities_create(pool);
 #endif
-    mpf_codec_capabilities_add(&caps->codecs,MPF_SAMPLE_RATE_16000,"LPCM");
+    mpf_codec_capabilities_add(&caps->codecs,c->engine->sample_rate==8000 ? MPF_SAMPLE_RATE_8000 :
+        c->engine->sample_rate==16000 ? MPF_SAMPLE_RATE_16000 : MPF_SAMPLE_RATE_8000|MPF_SAMPLE_RATE_16000,"LPCM");
     termination=mrcp_engine_audio_termination_create(c,&stream_vtable,caps,pool);
     c->base=mrcp_engine_channel_create(engine,&channel_vtable,c,termination,pool);
     return c->base;
@@ -488,7 +598,7 @@ static apt_bool_t stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *fr
     if (apr_thread_mutex_trylock(c->media_mutex)!=APR_SUCCESS) { apr_atomic_set32(&c->media_fault,1); return TRUE; }
     if (apr_atomic_read32(&c->media_state)!=HP_CAPTURING || cancelled(c)) { apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
     if (n%2) { apr_atomic_set32(&c->media_fault,1); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
-    if (c->total_samples+samples>(size_t)c->max_ms*HP_RATE/1000) { apr_atomic_set32(&c->media_state,HP_LIMIT); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
+    if (c->total_samples+samples>(size_t)c->max_ms*c->sample_rate/1000) { apr_atomic_set32(&c->media_state,HP_LIMIT); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
     if (c->engine->streaming) {
         if (!hp_ring_write(&c->ring,bytes,n)) { apr_atomic_set32(&c->media_fault,1); apr_thread_mutex_unlock(c->media_mutex); return TRUE; }
     } else { memcpy(c->audio.data+c->audio.len,bytes,n); c->audio.len+=n; }
@@ -496,9 +606,9 @@ static apt_bool_t stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *fr
     for (i=0;i<n;i+=2) { int16_t s; int32_t v; memcpy(&s,bytes+i,2); v=s; energy+=(uint64_t)((int64_t)v*v); }
     if (energy>=(uint64_t)c->engine->threshold*c->engine->threshold*samples) {
         c->run_samples+=samples;
-        if (c->run_samples>=(size_t)c->engine->activity_ms*HP_RATE/1000) { apr_atomic_set32(&c->speech,1); c->quiet_samples=0; }
+        if (c->run_samples>=(size_t)c->engine->activity_ms*c->sample_rate/1000) { apr_atomic_set32(&c->speech,1); c->quiet_samples=0; }
     } else { c->run_samples=0; if (apr_atomic_read32(&c->speech)) c->quiet_samples+=samples; }
-    if (apr_atomic_read32(&c->speech) && c->quiet_samples>=(size_t)c->silence_ms*HP_RATE/1000) apr_atomic_set32(&c->media_state,HP_RECOG_READY);
+    if (apr_atomic_read32(&c->speech) && c->quiet_samples>=(size_t)c->silence_ms*c->sample_rate/1000) apr_atomic_set32(&c->media_state,HP_RECOG_READY);
     apr_thread_mutex_unlock(c->media_mutex); return TRUE;
 }
 #endif

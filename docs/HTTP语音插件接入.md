@@ -8,9 +8,9 @@
 
 | 插件 | HTTP 契约 | 媒体 |
 |---|---|---|
-| httptts | POST JSON `{text, format:"wav", sample_rate:16000}`，返回 WAV 二进制 | 16 kHz PCM16 WAV；单声道或双声道，双声道取均值；输出单声道 |
-| httpasr | POST multipart：`file` WAV，`format=wav`，`sample_rate=16000`，`language_hints=zh`；返回 `{"text":"..."}` | 收集 16 kHz 单声道 PCM，停顿后封装完整 WAV |
-| httptts 流式 | POST `/api/v1/tts/stream`，JSON `{text, format:"pcm", sample_rate:16000}`；返回 `audio/pcm` | 每块 PCM 到达后进入 RTP 播放缓冲，不等待完整响应 |
+| httptts | POST JSON `{text, format:"wav", sample_rate:8000或16000}`，返回 WAV 二进制 | 按通道协商的采样率请求 PCM16 WAV；单声道或双声道，双声道取均值；输出单声道 |
+| httpasr | POST multipart：`file` WAV，`format=wav`，`sample_rate=8000或16000`，`language_hints=zh`；返回 `{"text":"..."}` | 收集协商采样率的单声道 PCM，停顿后封装完整 WAV |
+| httptts 流式 | POST `/api/v1/tts/stream`，JSON `{text, format:"pcm", sample_rate:8000或16000}`；返回 `audio/pcm` | 每块 PCM 到达后进入 RTP 播放缓冲，不等待完整响应 |
 | httpasr 流式 | WebSocket `/v1/asr/stream`，`start → started → 二进制 PCM → finish → completed` | 收音期间持续上传 PCM，并同步接收结果；使用 `completed.text` 生成 NLSML |
 
 每个 HTTP 请求携带随机 `X-Request-ID`。插件自身只记录该标识和错误类别，不记录文本、音频或 URL。
@@ -27,6 +27,8 @@ TTS 最大 25 MiB，文本最大 80 KiB。严格校验 WAV 容器长度、格式
 仅兼容既有 TTS 网关的标准 44 字节 WAV 头占位值：RIFF `0x7FFFFFBF`、data `0x7FFFFF9B`；普通截断文件不会被当作有效音频。
 ASR 空文字映射为 no-match，服务失败映射为 error。完整 WAV 模式无输入不会调用 HTTP；流式模式在 RECOGNIZE 时建立 WebSocket，无输入超时会关闭连接。
 VAD 是 PCM 能量与持续时间检测，需按实际电话音质调参，不代表噪声环境下的人声分类模型。
+
+2026-10-12 更新：两个插件支持同一实例中不同通道使用 8000 或 16000 Hz。两套示例配置默认 `sample-rate=auto`，RTP 使用 `L16/96/8000 L16/99/16000` 和 `own-preference=true`，优先 8 kHz；客户端只提供 16 kHz 时选择 16 kHz。模型请求、WAV 头、缓冲大小和 VAD 时长计算跟随实际协商结果，不把 16 kHz 音频改写头部冒充 8 kHz。TTS 返回的 WAV 采样率与请求不符时返回 error。
 
 ## 2. 构建与测试（Linux / amd64）
 
@@ -67,7 +69,7 @@ Sofia 路径应与实际系统架构和安装位置一致。Windows 检出的源
 | SIP 信令 | 8060 / UDP、TCP |
 | MRCP 控制 | 1544 / TCP |
 | UniMRCP RTP | 25000–25100 / UDP |
-| 协商音频 | L16 / 16000 Hz，单声道 |
+| 协商音频 | L16 / 8000 或 16000 Hz，单声道，优先 8000 |
 | ASR HTTP | `http://127.0.0.1:8887/v1/asr/upload` |
 | TTS HTTP | `http://127.0.0.1:8889/api/v1/tts` |
 
@@ -86,6 +88,8 @@ export UNIMRCP_HTTP_TTS_URL=http://实际可达的语音服务地址:8889/api/v1
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
+| sample-rate | auto | 允许 8000/16000，由 RTP 协商；也可设 8000 或 16000 仅允许该采样率。其他值使引擎初始化失败 |
+| tts-audio-dir | 插件默认不保存；示例启用 `/opt/unimrcp/var/tts` | TTS 完整合成音频保存目录，必须是绝对路径；空值关闭保存。可由 `UNIMRCP_TTS_AUDIO_DIR` 的非空值覆盖 |
 | stream-url | 未设置 | 非空即启用该引擎的流式模式，优先于 `url`；TTS 为 HTTP(S)，ASR 为 WS(S) |
 | http-timeout-ms | 60000 | HTTP 总超时 / ASR WebSocket 整个任务的超时，包含收音、等待结果和 TTS 背压暂停；HTTP 连接超时 5000 ms |
 | max-utterance-ms | 60000 | ASR 一轮收音的时长和内存上限，最多 120000 ms |
@@ -99,31 +103,40 @@ export UNIMRCP_HTTP_TTS_URL=http://实际可达的语音服务地址:8889/api/v1
 
 ### 3.1 使用 Docker Compose 启动已有镜像
 
-适用于 Linux / amd64 服务器和 Docker Compose V2 及以上版本。仓库根目录的 `docker-compose.yml` 会覆盖测试镜像的默认命令，使用 `-w -o 1` 启动常驻服务，并把 HTTP 插件配置只读挂载到安装目录。无需重新构建镜像。
+适用于 Linux / amd64 服务器和 Docker Compose V2 及以上版本。普通版部署配置统一位于 `deploy/http/`；Compose 会覆盖测试镜像的默认命令，使用 `-w -o 1` 启动常驻服务，并把 HTTP 插件配置只读挂载到安装目录。无需重新构建镜像。完整部署说明见 `deploy/INSTALL.txt`，仓库根目录的 Compose 仍可用于原有开发环境。
 
 将以下文件按目录结构上传到服务器，例如 `/opt/unimrcp-http/`：
 
 ```text
 unimrcp-http/
-├── docker-compose.yml
-├── .env.example
-├── conf/
-│   └── unimrcpserver-http.xml
-└── dist/
-    └── unimrcp-http.tar
+├── dist/
+│   ├── unimrcp-http-20261012-8k16k.tar.gz
+│   └── unimrcp-http-20261012-8k16k.tar.gz.sha256
+└── deploy/
+    ├── INSTALL.txt
+    ├── check_running_server.py
+    ├── http/
+    │   ├── docker-compose.yml
+    │   └── conf/unimrcpserver-http.xml
+    └── stream/
+        ├── docker-compose.yml
+        └── conf/unimrcpserver-http.xml
 ```
 
-镜像已导入时可省略 tar 文件和 `docker load`。首次部署在该目录执行：
+`dist/` 只存镜像和校验文件，其他部署资料统一放在 `deploy/`。镜像已导入时可省略镜像文件、校验及 `docker load`。首次部署从上述目录执行：
 
 ```sh
-docker load -i dist/unimrcp-http.tar
-cp .env.example .env
-vi .env
+cd dist
+sha256sum -c unimrcp-http-20261012-8k16k.tar.gz.sha256
+docker load -i unimrcp-http-20261012-8k16k.tar.gz
+cd ../deploy/http
+vi docker-compose.yml
 vi conf/unimrcpserver-http.xml
+mkdir -p tts-audio
 ```
 
-- `.env` 的 `UNIMRCP_IMAGE` 应与导入后的镜像名称和标签一致；Compose 只使用本地镜像，不自动拉取。
-- `.env` 的 ASR/TTS URL 必须从服务器可达。host 网络下的 `127.0.0.1` 是服务器本机；模型仍在 Windows 上时改成可达的 Windows 地址。其他 bridge 网络容器需要通过已发布的宿主机端口或其他可达地址访问。
+- Compose 的 `image` 直接填写导入后的镜像名称和标签，当前为 `unimrcp-http:20261012-8k16k`；只使用本地镜像，不自动拉取。
+- Compose 的 `environment` 直接填写 ASR/TTS URL，默认端口为 5004/5005；无需环境变量文件。host 网络下的 `127.0.0.1` 是服务器本机；模型仍在 Windows 上时改成可达的 Windows 地址。其他 bridge 网络容器需要通过已发布的宿主机端口或其他可达地址访问。
 - XML 的 `<properties><ip>` 默认是 `127.0.0.1`，适用于同机且共享宿主机网络的 FreeSWITCH。跨机器或从 bridge 网络容器连接时，改成服务器网卡上的可达 IP；SIP/MRCP/RTP 默认继承这个地址。处于 NAT 后方时还需按实际网络设置宣告地址。
 - HTTP 配置省略 `<sip-transport>`，使用当前 Debian 镜像支持的默认 UDP/TCP。不要恢复显式的 `udp,tcp` 列表：镜像内旧版 Sofia-SIP 的列表解析存在内存生命周期缺陷，诊断依据和已有部署的调整方法见 3.3 节。
 - 使用 `network_mode: host`，无需 `ports` 映射。跨机器使用 MRCPv2 时，允许 FreeSWITCH 访问服务器的 `8060/TCP、UDP`、`1544/TCP`、`25000–25100/UDP`。配置还启用了 MRCPv1 的 `1554/TCP`，仅使用 MRCPv2 时无需对外放行此端口。
@@ -139,7 +152,7 @@ docker compose logs --tail 100 -f unimrcp
 
 日志应显示 HTTP 插件成功加载，且没有端口绑定或引擎初始化错误。容器运行状态只说明进程存活，仍需按第 4 节验证真实 ASR/TTS 和 FreeSWITCH 链路。
 
-修改 `.env` 或 XML 后，重新创建容器以加载配置：
+修改 Compose 或 XML 后，重新创建容器以加载配置：
 
 ```sh
 docker compose up -d --force-recreate
@@ -147,7 +160,7 @@ docker compose up -d --force-recreate
 
 停止部署使用 `docker compose down`。服务配置了 `unless-stopped` 自动重启策略；Docker 服务随系统启动时可恢复运行中的容器。控制台日志由 Docker 轮转，每份最多 10 MiB、保留 3 份。
 
-Compose 配置语义参见 [Docker Compose 服务配置](https://docs.docker.com/reference/compose-file/services/) 和 [环境变量插值](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/)。
+Compose 配置语义参见 [Docker Compose 服务配置](https://docs.docker.com/reference/compose-file/services/)。
 
 ### 3.2 服务器无法下载 GDB 时的离线诊断
 
@@ -194,10 +207,10 @@ docker compose logs --tail 100 -f unimrcp
 
 直接用 `curl` 请求 ASR/TTS HTTP 接口，只能检查上游模型，不能验证 UniMRCP 插件和 SIP/MRCP/RTP。`tests/http-plugins/check_running_server.py` 是针对已运行服务的协议客户端：通过 SIP 建立 TTS 会话，发送 MRCP SPEAK，接收并保存 RTP 音频；随后建立 ASR 会话，将同一音频通过 RTP 回送，等待 MRCP RECOGNITION-COMPLETE 和 NLSML 识别文字。模型 HTTP 请求由当前服务端插件发起。
 
-将该脚本上传到服务器 Compose 目录，保存为 `check_running_server.py`，然后执行：
+部署时可使用 `deploy/check_running_server.py`，它与测试目录中的客户端一致。进入普通版 Compose 目录 `deploy/http/` 后执行：
 
 ```sh
-docker compose exec -T unimrcp python3 - < check_running_server.py
+docker compose exec -T unimrcp python3 - < ../check_running_server.py
 ```
 
 若服务器已有更新后的完整仓库，也可将输入重定向路径改为 `tests/http-plugins/check_running_server.py`。原镜像已包含 Python 和脚本复用的协议客户端，无需重建。脚本不启动另一套 UniMRCP 或模拟模型，不修改现有配置，不停止当前服务。默认连接容器内 `127.0.0.1:8060`，适用于当前 loopback / host 网络部署；IP 改为其他网卡地址的部署不适用本脚本。SIP 端口改变时可加 `--sip-port 端口`。
@@ -221,17 +234,20 @@ docker build -f tests/http-plugins/Dockerfile -t local/unimrcp-http:1.8.0-stream
 docker run --rm --network none local/unimrcp-http:1.8.0-stream
 ```
 
-已有服务器模型端口为 ASR 5004、TTS 5005 时，在 Compose 的 `.env` 中增加：
+已有服务器模型端口为 ASR 5004、TTS 5005 时，直接修改 Compose 中的镜像和流式地址：
 
-```dotenv
-UNIMRCP_IMAGE=local/unimrcp-http:1.8.0-stream
-UNIMRCP_STREAM_ASR_URL=ws://127.0.0.1:5004/v1/asr/stream
-UNIMRCP_STREAM_TTS_URL=http://127.0.0.1:5005/api/v1/tts/stream
+```yaml
+services:
+  unimrcp:
+    image: "local/unimrcp-http:1.8.0-stream"
+    environment:
+      UNIMRCP_STREAM_ASR_URL: "ws://127.0.0.1:5004/v1/asr/stream"
+      UNIMRCP_STREAM_TTS_URL: "http://127.0.0.1:5005/api/v1/tts/stream"
 ```
 
 将更新后的 `docker-compose.yml` 一同部署，再执行 `docker compose up -d --force-recreate`。单个变量非空只启用对应资源的流式模式；两个变量均为空且 XML 未设置 `stream-url` 时使用原完整 WAV 接口。也可取消 XML 中相应 `stream-url` 的注释。环境变量优先于 XML；如需回退，同时移除 XML 中的流式地址。
 
-ASR 开始消息固定使用 PCM、16000 Hz、`language_hints:["zh"]`。本地能量 VAD 仍负责 MRCP 的 START-OF-INPUT 和尾静音判停；收音结束后发 `finish` 并等待 `completed`。网关的 `max_sentence_silence` 使用 MRCP 的 Speech-Complete-Timeout 并限制在网关允许的 200–6000 ms。句子结果和最终全文可能有修订，插件仅采用最终全文。
+ASR 开始消息使用 PCM、当前通道协商的 8000 或 16000 Hz、`language_hints:["zh"]`。本地能量 VAD 仍负责 MRCP 的 START-OF-INPUT 和尾静音判停；收音结束后发 `finish` 并等待 `completed`。网关的 `max_sentence_silence` 使用 MRCP 的 Speech-Complete-Timeout 并限制在网关允许的 200–6000 ms。句子结果和最终全文可能有修订，插件仅采用最终全文。
 
 设置 `http-timeout-ms` 时需覆盖整轮收音及等待结果；如果 `max-utterance-ms` 设为 60000，可将前者设为 90000 留出连接和识别余量。STOP、BARGE-IN-OCCURRED 和通道关闭会终止当前传输，后续结果不会交给下一轮。TTS PAUSE/RESUME、ASR START-INPUT-TIMERS 在流式传输期间可处理。
 
@@ -241,50 +257,76 @@ WebSocket 收发使用 [libwebsockets 客户端 API](https://libwebsockets.org/l
 
 ### 3.6 并行部署第二套流式服务
 
-`deploy/stream/` 提供独立的 Compose、环境变量示例和 XML，可整体复制到服务器 `/opt/unimrcp-stream/`。ASR/TTS 模型服务仍使用服务器的 5004/5005 端口，两套 UniMRCP 可以共用它们。
+`deploy/stream/` 提供独立的 Compose 和 XML，与 `deploy/http/` 并列。镜像和流式 URL 直接写在 Compose 中。两套服务共用 `dist/unimrcp-http-20261012-8k16k.tar.gz` 镜像；ASR/TTS 模型服务仍使用服务器的 5004/5005 端口。
 
 | 配置 | 原有完整 WAV 服务 | 第二套流式服务 |
 |---|---|---|
 | Compose 项目名 | unimrcp-http | unimrcp-stream |
-| 镜像 | local/unimrcp-http:1.8.0 | unimrcp-http:20061008 |
+| 镜像 | unimrcp-http:20261012-8k16k | unimrcp-http:20261012-8k16k |
 | SIP | 8060 | 8061 |
 | MRCP | 1544 | 1545 |
 | RTSP | 1554 | 1555 |
 | RTP | 25000–25100 | 25200–25300 |
 
-`dist/unimrcp-http-20261008.tar` 的 manifest 中实际标签是 `unimrcp-http:20061008`；文件名不会决定镜像标签。包内 `httpasr`、`httptts` 插件包含流式入口。将镜像包也上传到新目录，目录结构为：
-
-```text
-/opt/unimrcp-stream/
-├── docker-compose.yml
-├── .env.example
-├── conf/
-│   └── unimrcpserver-http.xml
-└── unimrcp-http-20261008.tar
-```
-
-首次部署执行：
+按 3.1 节上传 `deploy/` 和 `dist/` 并导入镜像，然后从同时包含这两个目录的部署目录执行：
 
 ```sh
-cd /opt/unimrcp-stream
-docker load -i unimrcp-http-20261008.tar
-cp .env.example .env
-# 按模型所在机器修改 .env 的地址；按客户端网络修改 XML 的 properties/ip。
+cd deploy/stream
+# 按模型所在机器修改 Compose 的接口地址；按客户端网络修改 XML 的 properties/ip。
+mkdir -p tts-audio
 docker compose -p unimrcp-stream config --quiet
 docker compose -p unimrcp-stream up -d
 docker compose -p unimrcp-stream logs --tail 100 -f unimrcp
 ```
 
-Compose 要求两个流式 URL 都非空；省略或清空时会在配置检查阶段报错。新 XML 的 ASR 总超时为 90000 ms，为最多 60000 ms 收音保留等待结果的时间。端口已与仓库的旧配置错开；部署时还需确认这些端口没有被服务器其他服务占用。host 网络直接使用 XML 中的监听端口，无需添加 `ports`。
+Compose 已直接配置两个流式 URL。新 XML 的 ASR 总超时为 90000 ms，为最多 60000 ms 收音保留等待结果的时间。端口已与仓库的旧配置错开；部署时还需确认这些端口没有被服务器其他服务占用。host 网络直接使用 XML 中的监听端口，无需添加 `ports`。
 
 新 XML 默认 IP 为 `127.0.0.1`，适用于同机且共享宿主机网络的客户端；远程或 bridge 网络客户端需要使用服务器可达的网卡 IP。FreeSWITCH 为流式服务新增一个 profile，连接 SIP **8061**，并让客户端自身的 SIP/RTP 端口避开这两套服务。业务侧选择 profile 来决定使用哪套，自动故障切换需另行实现。
 
-更新这套服务的 `.env` 或 XML 后，在新目录执行 `docker compose -p unimrcp-stream up -d --force-recreate`。这里只提供部署配置；实际模型和 FreeSWITCH 通话仍需在服务器联调。
+更新这套服务的 Compose 或 XML 后，在新目录执行 `docker compose -p unimrcp-stream up -d --force-recreate`。这里只提供部署配置；实际模型和 FreeSWITCH 通话仍需在服务器联调。
+
+### 3.7 8/16 kHz 配置与 TTS 音频保存
+
+原有 `local/unimrcp-http:1.8.0` 和 `unimrcp-http:20061008` 镜像不包含本次功能，不能只更新 XML。先构建并测试新镜像；已有 `20061008` 开发镜像时可以离线增量构建：
+
+```sh
+docker build --network none -f tests/http-plugins/Dockerfile.update -t unimrcp-http:20261012-8k16k .
+docker run --rm --network none unimrcp-http:20261012-8k16k
+mkdir -p dist
+cd dist
+docker save unimrcp-http:20261012-8k16k | gzip > unimrcp-http-20261012-8k16k.tar.gz
+sha256sum unimrcp-http-20261012-8k16k.tar.gz > unimrcp-http-20261012-8k16k.tar.gz.sha256
+cd ..
+```
+
+增量构建复用镜像内已配置的源码和依赖，只重新编译、安装两个插件；严格编译检查排除原 UniMRCP 版本宏缺少 APR `is_dev` 初始化的已有警告。没有旧开发镜像时，用原 `tests/http-plugins/Dockerfile` 从源码完整构建相同新标签。
+
+新 XML 的两个引擎都使用 `sample-rate=auto`。若要固定 8 kHz，将两个引擎的参数都改成 `8000`，并将 RTP codecs 设为 `L16/96/8000`；固定 16 kHz 则使用 `16000` 和 `L16/99/16000`。新插件部署后，修改参数和 XML 并重启即可，无需再编译。要保持 8 kHz 优先、16 kHz 兼容，保留以下配置，FreeSWITCH 对应 profile 也应提供这两个 codec：
+
+```xml
+<param name="sample-rate" value="auto"/>
+<codecs own-preference="true">L16/96/8000 L16/99/16000</codecs>
+```
+
+上述两行分别位于 engine 和 rtp-settings，不是同一个 XML 父节点。上游 ASR 模型需支持实际协商的 8 kHz；网关接收并转发采样率参数，不代表所有模型都支持它。本地 TTS 网关提供 8/16 kHz WAV/PCM 参数，实际模型/音色组合仍需实测。
+
+TTS 的 `tts-audio-dir` 在两套示例中设为 `/opt/unimrcp/var/tts`；Compose 将部署目录下的 `./tts-audio` 挂载到该路径，两套部署各自保存。每次 SPEAK 使用与 HTTP `X-Request-ID` 相同的 UUID，生成 `<UUID>.wav`：单声道 PCM16，WAV 头记录真实采样率。普通模式保存经校验、转成单声道的完整合成音频，再开始播放；流式模式在工作线程中边接收边写入 `<UUID>.wav.part`，上游正常结束后补齐长度并改名为 `.wav`。保存的是生成音频，不包含等待上游时输出的静音，也不等同于电话录音。
+
+取消、异常断流和通道关闭会移除未完成的临时文件；完整合成已保存后，即使播放被打断，完整 WAV 仍保留。进程被强制杀死可能留下 `.part`，它不代表完整合成。目录或文件写入失败会记录错误并返回 TTS error，避免声称保存成功。RTP 回调不进行磁盘 I/O。录音目录需有写权限；没有自动过期清理，保留时长由部署方安排。日志只输出 request ID、采样率和音频字节数，可以据此定位文件。
+
+服务器部署时上传 `dist/` 中的新镜像及校验文件和 `deploy/` 中的配置，核对对应 Compose 的 `image` 为 `unimrcp-http:20261012-8k16k`，执行 `docker load` 和 `docker compose up -d --force-recreate`。单套部署直接修改各自的 Compose，不要用原镜像启动新配置。真实链路检查客户端默认使用 8000；进入 `deploy/http/` 或 `deploy/stream/` 后可分别验证：
+
+```sh
+docker compose exec -T unimrcp python3 - --sample-rate 8000 < ../check_running_server.py
+docker compose exec -T unimrcp python3 - --sample-rate 16000 < ../check_running_server.py
+```
+
+流式部署还需加 `--sip-port 8061`。检查输出的完整 WAV 和宿主机 `tts-audio` 中的新文件，并试听，确认模型实际支持对应采样率。
 
 ## 4. FreeSWITCH 联调前提
 
 FreeSWITCH 镜像还需编译安装 `mod_unimrcp` 及对应客户端依赖。仅启动此 Server 不会切换原有 Call 流程。
-FreeSWITCH 的 MRCP profile 要指向 Server 的 **SIP 端口 8060**，不是 MRCP TCP 端口 1544；双方音频协商设为 `L16/99/16000`。
+FreeSWITCH 的 MRCP profile 要指向 Server 的 **SIP 端口 8060**，不是 MRCP TCP 端口 1544；流式部署使用 SIP 8061。双方音频 codec 提供 `L16/96/8000 L16/99/16000`，服务器优先选择 8000；旧版镜像仍只能使用 `L16/99/16000`。
 为 FreeSWITCH MRCP 客户端选择独立 SIP/RTP 端口，避开 Server 的 8060、1544、25000–25100 及原 FreeSWITCH 的通话 RTP 范围。
 
 ASR 使用转写 URI，并设置 `define-grammar=false`，避免让客户端先发送本适配器未实现的 DEFINE-GRAMMAR。
@@ -294,6 +336,16 @@ ASR 使用转写 URI，并设置 `define-grammar=false`，避免让客户端先�
 Call 侧后续还需调整 ESL 事件订阅、前端判停、SFTP 就绪检查和文件式 TTS 缓存；本次没有替换正在使用的业务链路。
 
 ## 5. 验证与来源
+
+### 2026-10-12 8/16 kHz 与 TTS 保存验证
+
+基于本地 `unimrcp-http:20061008` 镜像，在禁用网络的构建中重新编译、安装两个插件，生成 `unimrcp-http:20261012-8k16k`。两个插件通过 `-Wall -Wextra -Werror` 编译检查，仅排除原 UniMRCP 版本宏的已有初始化警告。
+
+隔离容器内使用实际 UniMRCP Server、SIP/MRCP/RTP 和模拟 HTTP/WebSocket 模型，在 8000 和 16000 Hz 各跑一遍普通及流式完整回归，全部返回 0。WAV/PCM 与传输单元测试通过 ASan/UBSan。新增验证覆盖客户端先提供 16 kHz 时服务器仍优先选择 8 kHz、同一实例不同通道分别使用 8/16 kHz、固定采样率配置、采样率不匹配拒绝、保存 WAV 与上游生成 PCM 逐字节一致、流式增量写入及奇数 HTTP 块边界、保存目录失败及恢复、关闭保存、取消/异常/关闭后的临时文件清理。
+
+更新后的诊断客户端以标准输入运行，在同一正在运行的测试服务上分别完成 8/16 kHz 的 TTS→RTP→ASR 往返，返回 0。源码和部署包的 YAML/XML 已通过解析与一致性检查；本机未安装 Compose 插件，未执行 Compose 启动验证。
+
+当时的构建和测试日志已清理，以上保留验证结果。当前目录已统一：`dist/` 只保存压缩镜像及 SHA256 校验文件，`deploy/` 保存两套 UniMRCP 配置、`INSTALL.txt` 和链路检查客户端。源码、配置和镜像已在本地验证，未切换远程服务器或 FreeSWITCH 的运行实例；实际模型的 8 kHz 能力及真实电话音质仍需部署后验收。
 
 ### 2026-09-30 流式版本验证
 
@@ -305,7 +357,7 @@ Call 侧后续还需调整 ESL 事件订阅、前端判停、SFTP 就绪检查�
 - 流式 ASR 在收音结束前上传；分片 JSON、ping、中间结果修订、最终全文、空结果、非法/过大消息、断线、启动/结束超时、无输入、输入计时器和识别超时处理通过。
 - 环境 HTTP 代理禁用、重定向拒绝、ASR/TTS 并发通道、取消后复用、传输中关闭及服务正常退出通过。
 
-最终测试日志：`dist/stream-final-test.log`，完整测试返回 0。模型上游使用与现有服务协议一致的模拟接口；真实模型和 FreeSWITCH 电话仍需部署后联调。本机 WSLC 返回 `0x8007273d`，因此本次未生成新的 Docker 镜像归档；上面的源码构建与协议测试已在临时 Linux 环境完成，运行中的服务未改动。
+完整测试返回 0；当时的测试日志已清理。模型上游使用与现有服务协议一致的模拟接口；真实模型和 FreeSWITCH 电话仍需部署后联调。本机 WSLC 返回 `0x8007273d`，因此本次未生成新的 Docker 镜像归档；上面的源码构建与协议测试已在临时 Linux 环境完成，运行中的服务未改动。
 
 ### 原 HTTP 版本的验证记录
 
@@ -342,9 +394,9 @@ wslc run --rm --network none local/unimrcp-http:1.8.0
 
 服务器报告的环境为 `4.18.0-193.el8.x86_64` / Docker `26.1.3`，启动退出码为 139，`OOMKilled=false`，绕过 `stdbuf` 后仍发生段错误。后续离线 GDB 已定位到 Sofia-SIP 的 `su_casematch`，详见 3.3 节。将本地 `nofile` 软硬限制都调为服务器的 `1048576` 后仍未复现 SIGSEGV；不能据此认定内核或文件句柄限制是根因。
 
-省略显式协议列表后，使用原镜像挂载工作区更新后的 XML 和测试脚本，在 `--network none --ulimit nofile=1048576:1048576` 下完成回归，返回 0：TCP SIP OPTIONS 返回 200，UDP SIP 会话和全部 ASR/TTS、错误处理、并发、取消及正常关闭测试通过。测试日志为 `dist/unimrcp-default-transport-test.log`。服务器随后用诊断镜像复验，未再出现原启动段错误；常驻模式也已报告启动成功，详见 3.3 节。
+省略显式协议列表后，使用原镜像挂载工作区更新后的 XML 和测试脚本，在 `--network none --ulimit nofile=1048576:1048576` 下完成回归，返回 0：TCP SIP OPTIONS 返回 200，UDP SIP 会话和全部 ASR/TTS、错误处理、并发、取消及正常关闭测试通过。当时的测试日志已清理。服务器随后用诊断镜像复验，未再出现原启动段错误；常驻模式也已报告启动成功，详见 3.3 节。
 
-真实链路首次验证返回 TTS `004 error`。容器内诊断确认，实际 TTS 地址仍是 `http://127.0.0.1:8889/api/v1/tts`，连接被拒绝（Errno 111）。将 `.env` 中的模型地址改为 ASR `http://127.0.0.1:5004/v1/asr/upload`、TTS `http://127.0.0.1:5005/api/v1/tts` 并重新创建容器后，用户回传的服务器测试输出如下：
+真实链路首次验证返回 TTS `004 error`。容器内诊断确认，实际 TTS 地址仍是 `http://127.0.0.1:8889/api/v1/tts`，连接被拒绝（Errno 111）。将模型地址改为 ASR `http://127.0.0.1:5004/v1/asr/upload`、TTS `http://127.0.0.1:5005/api/v1/tts` 并重新创建容器后，用户回传的服务器测试输出如下：
 
 ```text
 Checking existing UniMRCP at 127.0.0.1:8060; text: 你好，这是一段语音测试。

@@ -13,7 +13,17 @@
 dist/
 # /
 /.env
+/deploy/http/.env
 /deploy/stream/.env
+/tts-audio/
+/deploy/http/tts-audio/
+/deploy/stream/tts-audio/
+__pycache__/
+/deploy/single-directory/docker-compose.yml
+/deploy/single-directory/migration.json
+/deploy/single-directory/conf/
+/deploy/single-directory/old-config/
+/deploy/single-directory/tts-audio/
 /debug
 /release
 /Debug

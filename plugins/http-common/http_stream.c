@@ -82,7 +82,7 @@ static size_t tts_receive(char *data, size_t size, size_t count, void *context)
     curl_easy_getinfo(s->easy,CURLINFO_RESPONSE_CODE,&code);
     curl_easy_getinfo(s->easy,CURLINFO_CONTENT_TYPE,&type);
     if (code!=200 || !type || (strcmp(type,"audio/pcm") && strncmp(type,"audio/pcm;",10)) ||
-        len>CURL_MAX_WRITE_SIZE || len>HP_MAX_AUDIO-s->audio_bytes) return 0;
+        len>CURL_MAX_WRITE_SIZE || len>HP_MAX_AUDIO-44-s->audio_bytes) return 0;
     if (s->tail_valid) pcm[0]=s->tail;
     memcpy(pcm+s->tail_valid,data,len); swap_pcm(pcm,aligned);
     accepted=aligned ? s->sink(s->context,pcm,aligned) : 1;
@@ -94,18 +94,18 @@ static size_t tts_receive(char *data, size_t size, size_t count, void *context)
 }
 
 hp_stream *hp_stream_tts(const char *url, const char *text, size_t len,
-                         const char *id, long timeout, hp_pcm_sink sink, void *context)
+                         const char *id, int rate, long timeout, hp_pcm_sink sink, void *context)
 {
     hp_stream *s; char header[128]; struct curl_slist *next;
     if (!url || (strncmp(url,"http://",7) && strncmp(url,"https://",8)) ||
-        !valid_id(id) || !sink || !len || len>HP_MAX_TEXT || memchr(text,0,len)) return NULL;
+        !hp_rate_valid(rate) || !valid_id(id) || !sink || !len || len>HP_MAX_TEXT || memchr(text,0,len)) return NULL;
     s=calloc(1,sizeof(*s)); if (!s) return NULL;
     s->sink=sink; s->context=context;
     s->easy=curl_easy_init(); s->multi=curl_multi_init(); s->request=json_object_new_object();
     if (!s->easy || !s->multi || !s->request) goto fail;
     json_object_object_add(s->request,"text",json_object_new_string_len(text,(int)len));
     json_object_object_add(s->request,"format",json_object_new_string("pcm"));
-    json_object_object_add(s->request,"sample_rate",json_object_new_int(HP_RATE));
+    json_object_object_add(s->request,"sample_rate",json_object_new_int(rate));
     snprintf(header,sizeof(header),"X-Request-ID: %s",id);
     s->headers=curl_slist_append(NULL,header); if (!s->headers) goto fail;
     next=curl_slist_append(s->headers,"Content-Type: application/json"); if (!next) goto fail;
@@ -215,13 +215,13 @@ static const struct lws_protocols asr_protocols[]={
 
 static void service_tick(lws_sorted_usec_list_t *timer) { (void)timer; }
 
-hp_stream *hp_stream_asr(const char *url, const char *id, long timeout,
+hp_stream *hp_stream_asr(const char *url, const char *id, int rate, long timeout,
                          long silence_ms, hp_pcm_source source, void *context)
 {
     hp_stream *s; struct lws_context_creation_info info;
     struct lws_client_connect_info conn;
     const char *protocol,*address,*path; int port; size_t n;
-    if (!url || (strncmp(url,"ws://",5) && strncmp(url,"wss://",6)) || !valid_id(id) || !source) return NULL;
+    if (!hp_rate_valid(rate) || !url || (strncmp(url,"ws://",5) && strncmp(url,"wss://",6)) || !valid_id(id) || !source) return NULL;
     s=calloc(1,sizeof(*s)); if (!s) return NULL;
     n=strlen(url); s->url=malloc(n+1); s->path=malloc(n+2); s->host=malloc(n+8);
     if (!s->url || !s->path || !s->host) goto fail;
@@ -232,7 +232,7 @@ hp_stream *hp_stream_asr(const char *url, const char *id, long timeout,
     s->source=source; s->context=context; s->message.limit=1024*1024;
     if (silence_ms<200) silence_ms=200;
     if (silence_ms>6000) silence_ms=6000;
-    snprintf(s->start,sizeof(s->start),"{\"type\":\"start\",\"format\":\"pcm\",\"sample_rate\":16000,\"language_hints\":[\"zh\"],\"max_sentence_silence\":%ld}",silence_ms);
+    snprintf(s->start,sizeof(s->start),"{\"type\":\"start\",\"format\":\"pcm\",\"sample_rate\":%d,\"language_hints\":[\"zh\"],\"max_sentence_silence\":%ld}",rate,silence_ms);
     memset(&info,0,sizeof(info));
     info.port=CONTEXT_PORT_NO_LISTEN; info.protocols=asr_protocols; info.user=s;
     info.uid=-1; info.gid=-1;

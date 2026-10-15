@@ -1,0 +1,76 @@
+UniMRCP 8/16 kHz + TTS 音频保存部署说明
+
+镜像标签：unimrcp-http:20261012-8k16k
+两套服务默认优先 8000 Hz，兼容仅提供 16000 Hz 的客户端。
+ASR/TTS 仍使用已有模型服务，默认服务器端口 5004/5005。
+
+目录分工：dist 只保存镜像和校验文件，deploy 保存部署配置与工具。
+上传时保留以下结构；无需上传源码仓库的其他目录：
+
+部署目录/
+├── dist/
+│   ├── unimrcp-http-20261012-8k16k.tar.gz
+│   └── unimrcp-http-20261012-8k16k.tar.gz.sha256
+└── deploy/
+    ├── INSTALL.txt
+    ├── check_running_server.py
+    ├── http/
+    │   ├── docker-compose.yml
+    │   └── conf/unimrcpserver-http.xml
+    └── stream/
+        ├── docker-compose.yml
+        └── conf/unimrcpserver-http.xml
+
+1. 首次导入镜像（从同时包含 dist 和 deploy 的部署目录执行）：
+   cd dist
+   sha256sum -c unimrcp-http-20261012-8k16k.tar.gz.sha256
+   docker load -i unimrcp-http-20261012-8k16k.tar.gz
+   cd ..
+   镜像已导入时可跳过；两套服务共用这一个镜像。
+
+2. 普通服务（从部署目录执行；SIP 8060，MRCP 1544，RTP 25000-25100）：
+   cd deploy/http
+   # 核对 docker-compose.yml 中的 image 和接口地址。
+   # 跨机器客户端还需修改 XML 的 properties/ip。
+   mkdir -p tts-audio
+   docker compose config --quiet
+   docker compose up -d --force-recreate
+   docker compose logs --tail 100 -f unimrcp
+
+3. 流式服务（另开终端，从部署目录执行；SIP 8061，MRCP 1545，RTP 25200-25300）：
+   cd deploy/stream
+   # 核对 docker-compose.yml 中的流式 URL 和 XML 的 properties/ip。
+   mkdir -p tts-audio
+   docker compose config --quiet
+   docker compose up -d --force-recreate
+   docker compose logs --tail 100 -f unimrcp
+
+只需要其中一种模式时，只启动对应目录下的服务。
+镜像和接口地址均直接写在各自的 docker-compose.yml 中，无需环境变量文件。
+修改 image 可切换镜像；修改 environment 中的 URL 可切换模型地址。
+普通版使用 HTTP ASR/TTS 地址，流式版使用 WebSocket ASR 和流式 HTTP TTS 地址。
+
+已有服务请在原部署目录替换对应 XML、Compose，核对 image 为：
+unimrcp-http:20261012-8k16k
+从原目录执行 docker compose up -d --force-recreate。
+迁移到新目录时，先停止原服务释放同名项目和端口，避免重复启动。
+旧双服务部署使用过 SIP 8062；这里的流式 SIP 为 8061。
+如实际客户端仍连接 8062，可保留原流式 SIP 端口，并同步修改客户端 profile。
+
+4. TTS 保存：
+   容器目录：/opt/unimrcp/var/tts
+   宿主机目录：deploy/http/tts-audio 和 deploy/stream/tts-audio
+   文件名：<HTTP X-Request-ID>.wav
+   格式：单声道 PCM16 WAV；采样率为实际协商的 8000 或 16000。
+   合成过程中使用 .wav.part，正常结束后发布 .wav；取消或失败时清理临时文件。
+   保存生成的完整音频，不是通话录音。保存目录必须可写，没有自动过期清理。
+   目录配置位于 HTTP-TTS engine 的 tts-audio-dir 参数。
+
+5. 真实模型链路检查（从部署目录进入 deploy 后执行）：
+   cd deploy
+   docker compose -f http/docker-compose.yml exec -T unimrcp python3 - --sample-rate 8000 < check_running_server.py
+   docker compose -f http/docker-compose.yml exec -T unimrcp python3 - --sample-rate 16000 < check_running_server.py
+   docker compose -f stream/docker-compose.yml exec -T unimrcp python3 - --sip-port 8061 --sample-rate 8000 < check_running_server.py
+   docker compose -f stream/docker-compose.yml exec -T unimrcp python3 - --sip-port 8061 --sample-rate 16000 < check_running_server.py
+
+本地隔离测试使用模拟模型；实际 ASR 模型是否支持 8 kHz 仍需上面的真实链路检查。
